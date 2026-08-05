@@ -1,0 +1,23 @@
+[package]
+name = "access_control"
+description = "Name-based access control for DHttp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true, features = ["json", "query"] }
+chrono = { version = "0.4", features = ["serde"] }
+http = { workspace = true }
+radix_trie = { workspace = true }
+sea-orm = { workspace = true, features = ["sqlx-sqlite"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11"
+snafu = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true, features = ["util"] }
