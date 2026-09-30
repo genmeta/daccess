@@ -1,23 +1,23 @@
 [package]
 name = "access_control"
 description = "Name-based access control for DHttp"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
-axum = { workspace = true, features = ["json", "query"] }
+axum = { version = "0.8", default-features = false, features = ["json", "query"] }
 chrono = { version = "0.4", features = ["serde"] }
-http = { workspace = true }
-radix_trie = { workspace = true }
-sea-orm = { workspace = true, features = ["sqlx-sqlite"] }
-serde = { workspace = true }
-serde_json = { workspace = true }
+http = "1"
+radix_trie = "0.2"
+sea-orm = { version = "2", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.11"
-snafu = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+snafu = "0.9"
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-http-body-util = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
-tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["macros", "rt"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }

@@ -23,12 +23,15 @@
 
 ## 接入步骤
 
-在 workspace crate 中加入依赖：
+将本库作为外部依赖加入 pishoo 或其他承载应用：
 
 ```toml
 [dependencies]
-access_control = { path = "../access" }
+access_control = "0.1"
 ```
+
+在尚未发布到 registry 的联合开发阶段，承载应用应固定一个明确的 Git revision；
+临时 `path` 依赖只用于本地联调，不代表本库属于承载应用的 Cargo workspace。
 
 ### 1. 为 profile 创建 AccessService
 
@@ -188,6 +191,6 @@ acl.set_policy(
 ## 验证
 
 ```bash
-cargo test -p access_control
-cargo check --workspace
+cargo test
+cargo check
 ```
