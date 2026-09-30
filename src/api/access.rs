@@ -63,6 +63,16 @@ pub(crate) struct EffectItems {
     deny: Vec<String>,
 }
 
+impl EffectItems {
+    fn push(&mut self, effect: Effect, value: String) {
+        match effect {
+            Effect::Allow => self.allow.push(value),
+            Effect::Review => self.review.push(value),
+            Effect::Deny => self.deny.push(value),
+        }
+    }
+}
+
 pub(crate) type RulesByApiTree = BTreeMap<String, BTreeMap<String, EffectItems>>;
 pub(crate) type RulesByNameTree = BTreeMap<String, BTreeMap<String, EffectItems>>;
 pub(crate) type RulesByMethod = BTreeMap<String, EffectItems>;
@@ -124,11 +134,7 @@ impl AccessService {
             let effect = String::try_get(&row, "", "effect")?.parse()?;
             let grantee = String::try_get(&row, "", "grantee")?;
             let rules = tree.entry(api).or_default().entry(method).or_default();
-            match effect {
-                Effect::Allow => rules.allow.push(grantee),
-                Effect::Review => rules.review.push(grantee),
-                Effect::Deny => rules.deny.push(grantee),
-            }
+            rules.push(effect, grantee);
         }
         Ok(tree)
     }
@@ -149,11 +155,7 @@ impl AccessService {
             let effect = String::try_get(&row, "", "effect")?.parse()?;
             let method = String::try_get(&row, "", "method")?;
             let rules = tree.entry(grantee).or_default().entry(api).or_default();
-            match effect {
-                Effect::Allow => rules.allow.push(method),
-                Effect::Review => rules.review.push(method),
-                Effect::Deny => rules.deny.push(method),
-            }
+            rules.push(effect, method);
         }
         Ok(tree)
     }
@@ -250,11 +252,7 @@ impl AccessService {
             let effect = String::try_get(&row, "", "effect")?.parse()?;
             let grantee = String::try_get(&row, "", "grantee")?;
             let rules = tree.entry(api).or_default().entry(method).or_default();
-            match effect {
-                Effect::Allow => rules.allow.push(grantee),
-                Effect::Review => rules.review.push(grantee),
-                Effect::Deny => rules.deny.push(grantee),
-            }
+            rules.push(effect, grantee);
         }
         Ok((total, tree))
     }
@@ -279,11 +277,7 @@ impl AccessService {
             let effect = String::try_get(&row, "", "effect")?.parse()?;
             let grantee = String::try_get(&row, "", "grantee")?;
             let rules = rules.entry(method).or_default();
-            match effect {
-                Effect::Allow => rules.allow.push(grantee),
-                Effect::Review => rules.review.push(grantee),
-                Effect::Deny => rules.deny.push(grantee),
-            }
+            rules.push(effect, grantee);
         }
         Ok(rules)
     }
@@ -334,8 +328,9 @@ impl AccessService {
                ON CONFLICT(grantee, method, api) DO UPDATE SET effect = excluded.effect, grantee_type = excluded.grantee_type, updated_at = excluded.updated_at"#,
             [method_value.into(), api_value.into(), effect.as_str().into(), grantee.key().into(), grantee.to_string().into()])).await?;
         Self::validate_management_administrators(&transaction, &self.owner_name).await?;
+        let next_policies = Self::policies_from_db(&transaction, &self.owner_name).await?;
         transaction.commit().await?;
-        policies.modify(method, api, effect, grantee);
+        *policies = next_policies;
         Ok(())
     }
 
@@ -362,8 +357,9 @@ impl AccessService {
             ))
             .await?;
         Self::validate_management_administrators(&transaction, &self.owner_name).await?;
+        let next_policies = Self::policies_from_db(&transaction, &self.owner_name).await?;
         transaction.commit().await?;
-        policies.remove(method, api, grantee);
+        *policies = next_policies;
         Ok(())
     }
 }
