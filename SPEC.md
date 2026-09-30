@@ -16,7 +16,7 @@
 2. 访问规则用于决定某个主体能否调用特定 HTTP 方法和 API 路径；
 3. 审批记录用于承载不能立即允许或拒绝的请求。
 
-设计的核心约束是：名称由传输层 mTLS 认证，`SubjectId` 用于确认该名称背后的主体是否发生转让；规则是本地入站授权的唯一事实来源；联系人交换的权限声明只描述双方提出或公开的能力，不能替代本地规则；实时审批与持久审批可以重叠，但管理界面只展示 live 项，并由 live 审批清理重叠的持久记录。
+设计的核心约束是：名称由传输层 mTLS 认证，`SubjectId` 用于确认该名称背后的主体是否发生转让；规则是本地入站授权的唯一事实来源；联系人交换的权限声明只描述双方提出或公开的能力，不能替代本地规则；审批始终持久化，并且原业务请求绝不等待管理员决定。
 
 ## 1. 规范性语言
 
@@ -42,11 +42,11 @@
 **Effect**
 : 规则结果之一：`allow`、`review` 或 `deny`。
 
-**Live Review**
-: 仅存在于当前进程内存中、并持有等待中请求状态的实时审批。
+**Review**
+: 存储在 SQLite 中、由服务端内部 request ID 去重的审批记录。它与发起审批的 HTTP/DHTTP 连接没有生命周期关系。
 
-**Persistent Review**
-: 存储在 SQLite 中、以 `(visitor, request_id)` 标识的可跨请求使用的审批记录。
+**Request ID**
+: 服务端从 method、path、普通 header、已验证 visitor 名称和 `SubjectId` 派生的 SHA-256 值。它不属于 HTTP 协议字段，调用方不得提供或伪造它。
 
 **Requested Access**
 : 对方向本方提出的 API 权限请求。它尚未带有 `allow` 或 `review` 结论。
@@ -65,7 +65,7 @@
 - 一个身份的管理员修改规则后意外影响另一个身份；
 - 联系人同名时无法区分其所属信任域；
 - 审批记录跨身份复用；
-- 数据库连接、内存策略树和实时审批注册表的生命周期不一致。
+- 数据库连接、内存策略树和审批记录的生命周期不一致。
 
 ### 3.2 名称与主体标识分离
 
@@ -87,11 +87,11 @@
 
 这种分离消除了两个本地事实来源之间的同步竞争，并允许 `deny`、组规则、匿名规则等并不属于联系人声明的规则正常存在。
 
-### 3.4 实时审批与持久审批分离
+### 3.4 异步审批
 
-没有 `RequestId` 的请求只能实时等待；带有 `RequestId` 的已命名请求同时获得持久记录，使管理员能够在请求连接消失后作出决定。
+命中 `review` 的请求不会持有 HTTP/DHTTP stream。服务端立即创建或复用一条 SQLite pending 记录，并由承载应用返回 `202 Accepted`、审批 id 和状态查询 URL。调用方随后使用原身份查询状态；状态为 `allowed` 时，重试原业务请求；状态为 `denied` 或 `expired` 时，不得执行该请求。
 
-二者不能简单合并：实时审批持有唤醒请求所需的进程内状态，持久审批则提供跨连接、跨请求的决定缓存。因此管理 API 分别列出两类审批；重叠项只在 live 列表展示，并由 live 决定清理持久记录。
+因此审批不依赖连接取消、Future/Waker、进程内注册表或单 stream reset 信号。pishoo 重启后 pending 和已决定记录仍可查询；只有原业务请求重试时才消费一次 allow/deny 决定。
 
 ## 4. 数据表示
 
@@ -242,7 +242,7 @@ license     = Apache-2.0
 | 列              | 类型    | 约束与语义                       |
 | --------------- | ------- | -------------------------------- |
 | `id`            | INTEGER | 自增主键                         |
-| `request_id`    | TEXT    | 非空请求标识                     |
+| `request_id`      | TEXT    | 服务端生成的内部请求标识，不对调用方暴露 |
 | `visitor`       | TEXT    | 非空访问者名称                   |
 | `visitor_sid`   | BLOB    | 1 至 64 字节                     |
 | `method`        | TEXT    | 大写 HTTP 方法                   |
@@ -253,7 +253,7 @@ license     = Apache-2.0
 | `updated_at`    | INTEGER | Unix 秒时间戳                    |
 | `created_at`    | INTEGER | Unix 秒时间戳                    |
 
-唯一键为 `(visitor, request_id)`。同一键还必须持续绑定同一 `method` 和 `api`；在记录未过期时也必须绑定同一 `visitor_sid`。尝试使用相同键访问其他方法、路径或身份时必须返回错误。
+唯一键为 `(visitor, request_id)`。同一键还必须持续绑定同一 `method` 和 `api`；在记录未过期时也必须绑定同一 `visitor_sid`。调用方不能传入该值，因而不能让某个审批决定绑定到另一身份或请求。
 
 `expired_after` 必须晚于 `created_at`。新建 pending 记录的默认有效期为创建后一天。索引 `(stage, expired_after)` 支持待审批和有效期查询。
 
@@ -282,7 +282,7 @@ license     = Apache-2.0
 - 名称与 `SubjectId` MUST 同时存在或同时缺失；
 - 路径 MUST 以 `/` 开头；
 - 查询字符串在匹配前 MUST 被移除；
-- 匿名请求携带 `RequestId` 并进入 review 时 MUST 被拒绝，因为持久审批无法安全绑定 visitor。
+- 匿名请求命中 `review` 时 MUST 被拒绝，因为审批状态无法安全绑定和查询该 visitor。
 
 ### 7.2 候选 grantee
 
@@ -326,46 +326,36 @@ license     = Apache-2.0
 
 - `Allowed`：调用方可以继续处理请求；
 - `Denied`：调用方必须拒绝请求；
-- `Reviewing(id, state, registry)`：调用方等待 `state`，由管理 API 允许、拒绝或由请求生命周期取消。
+- `Reviewing(PendingReview)`：调用方必须立即返回 `202 Accepted`，不得等待管理员决定。
 
 ## 8. 审批协议
 
-### 8.1 无 RequestId 的请求
+### 8.1 创建或复用 pending
 
-系统只创建 live review，不创建 `access_reviews` 数据库记录。管理员针对其 live `id` 作出的决定只完成该请求。
+只有具有经 mTLS 验证名称和 `SubjectId` 的请求才能进入审批。服务端从请求的 method、path、普通 header、visitor 名称和 `SubjectId` 派生内部 request ID；调用方不携带、选择或控制该值。
 
-### 8.2 带 RequestId 的请求
+处理顺序如下：
 
-RequestId 由请求方按第 13.3 节算法生成，但它是可选的。只有请求明确携带 RequestId，并且同时具有经 mTLS 验证的名称和 `SubjectId` 时，才可以创建 persistent review。处理顺序为：
+1. 查询与 visitor、request ID、`SubjectId`、method 和 API 完全匹配且未过期的已决定记录；若存在，通过 `DELETE ... RETURNING` 原子消费，并立即返回 allow 或 deny；
+2. 否则查询 `(visitor, request_id)`；有效记录绑定另一 `SubjectId` 时拒绝，method 或 API 不同也拒绝；
+3. 有效 pending 存在时，返回同一个数据库 id；
+4. 不存在记录时，创建有效期一天的 pending；
+5. 已过期记录重置为 pending，并更新 `SubjectId`、原因和有效期。
 
-1. 服务使用当前请求的 method、path、普通 header、来访者名称和 `SubjectId` 重新计算 RequestId；
-2. 请求携带值与计算结果不同则拒绝，不得创建或消费 persistent review；
-3. 在事务中查找与 visitor、RequestId、SubjectId、method 和 API 完全匹配且尚未过期的已决定记录；
-4. 若存在，删除该记录并立即返回其 allow 或 deny 结果；
-5. 否则检查 `(visitor, request_id)` 是否已经绑定其他 method 或 API，冲突则拒绝；
-6. 有效记录绑定其他 `SubjectId` 时拒绝；
-7. 不存在记录时创建有效期一天的 pending；
-8. 已过期记录重置为 pending，并更新 `SubjectId`、原因和有效期；
-9. pending 请求同时进入 live registry，等待管理员处理。
+承载应用在步骤 3 至 5 返回 `202 Accepted`：
 
-已决定的 persistent review 是一次性决定：成功匹配后通过 `DELETE ... RETURNING` 原子消费。它不是长期访问规则。长期授权必须写入 `access_rules`。
+```json
+{
+  "review_id": 12,
+  "status_url": "/acl/review/12/status"
+}
+```
 
-### 8.3 列表去重
+该 `202` 不代表原业务请求已执行。调用方以创建审批的同一 mTLS 身份请求 `status_url`，得到 `pending`、`allowed`、`denied` 或 `expired`。`allowed` 时必须使用相同的请求字段重试原业务请求；重试会原子消费该决定。已决定记录不是长期规则，长期授权必须写入 `access_rules`。
 
-live 与 persistent 列表分别分页。若某个 `(visitor, request_id)` 同时存在于两处：
+### 8.2 管理队列
 
-- 它 MUST 显示在 live 列表；
-- 它 MUST 从 persistent 列表的 `total` 和 `items` 中排除。
-
-这样前端可以分别展示“当前仍在等待的连接”和“离线待处理记录”，同时不会让管理员对同一请求看到两个独立任务。
-
-### 8.4 决定联动
-
-当 live review 具有重叠的 pending persistent 记录时，审批 live 项必须先删除该持久记录，再立即完成 live 请求。这个决定正被当前请求消费，不写入有效期，也不要求 `expired_after`。
-
-persistent 项只有在没有对应 live 项时才会显示和被审批，因此审批 persistent 项只更新数据库，不反向查找或完成 live 请求。若两类状态在列表读取后发生竞态，后续 live 审批仍以删除 persistent 项并完成当前请求为准。
-
-同一 RequestId 对应同一个规范化请求。直接审批其中一个 live 项会完成内存中所有具有相同 RequestId 的 live 等待者。
+管理 API 只展示未过期的持久 pending 记录，按数据库 id 递增分页。管理员 allow 或 deny 时必须提供决定有效期；更新只匹配仍为 pending 且未过期的 id，避免覆盖并发决定或过期记录。
 
 ## 9. 联系人交换协议
 
@@ -689,22 +679,20 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 
 ### 10.4 审批管理 API
 
-#### `GET /acl/reviews/live`
+#### `GET /acl/reviews`
 
-分页列出实时审批，按递增 live id 排序：
+分页列出未过期 pending 审批，按递增数据库 id 排序：
 
 ```json
 {
   "items": [
     {
-      "kind": "live",
-      "id": 7,
-      "request_id": "9b1d5c7f4e2a60819384756647382910aabbccddeeff00112233445566778899",
+      "id": 12,
       "visitor": "alice.example",
       "method": "GET",
       "api": "/private",
       "reason": "matched review rule: GET /private alice.example",
-      "expired_after": null
+      "expired_after": "2026-08-05T12:00:00Z"
     }
   ],
   "total": 1,
@@ -713,30 +701,27 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 }
 ```
 
-#### `GET /acl/reviews/persistent`
+#### `GET /acl/review/{id}/status`
 
-分页列出 stage 为 pending 且未在 live 列表中展示的持久审批，按数据库 id 递增排序。响应形状与 live 相同，但 `kind` 为 `persistent`，且 `request_id`、`visitor` 和 `expired_after` 存在。
+供发起审批的业务调用方轮询。该端点不执行常规业务 ACL 匹配，以免状态查询再次进入审批；它必须从已验证 `Visitor` extension 读取身份，并只返回该名称和 `SubjectId` 创建的记录。身份不匹配或 id 不存在返回 404，缺少已验证身份返回 403。
+
+```json
+{ "status": "pending" }
+```
+
+`status` 为 `pending`、`allowed`、`denied` 或 `expired`。它不会消费 allow/deny 决定。
 
 #### `PATCH /acl/review`
 
-审批实时项：
-
-```json
-{ "kind": "live", "id": 7, "action": "allow" }
-```
-
-审批持久项：
-
 ```json
 {
-  "kind": "persistent",
   "id": 12,
   "action": "deny",
   "expired_after": "2026-08-05T12:00:00Z"
 }
 ```
 
-`action` 只接受 `allow` 或 `deny`。live 决定不需要 `expired_after`，即使它与 persistent 记录重叠；该 persistent 记录会被直接删除。只有 persistent 决定必须提供 `expired_after`，且写入值必须满足数据库的时间约束。成功返回 204；已经决定或不存在的 id 返回 404。
+`action` 只接受 `allow` 或 `deny`，`expired_after` 必填且必须晚于当前时间。成功返回 204；已经决定、已过期或不存在的 id 返回 404。
 
 ## 11. 一致性与并发
 
@@ -752,9 +737,7 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 
 ### 11.3 审批状态
 
-live review 状态通过互斥锁保护，并通过 Future/Waker 唤醒等待请求。批准、拒绝和取消是终态；重复决定不会改变已经结束的状态。
-
-持久决定的消费使用单条 `DELETE ... RETURNING`，以避免同一个决定被多个请求重复使用。
+pending 到 allow/deny 的转换使用带 `stage = 0` 和有效期条件的单条 `UPDATE`，因此两个管理员并发决定时只有一个成功。已决定记录在匹配的业务请求重试时使用单条 `DELETE ... RETURNING` 消费，避免同一个决定被多个请求重复使用。审批没有内存等待者，也不会因连接关闭而取消。
 
 ## 12. 错误处理要求
 
@@ -793,9 +776,9 @@ Owner 不写入联系人表。管理路由使用 `AccessService` 持有的 profi
 
 因此，本模块使用名称决定“是谁”，使用 `SubjectId` 判断“是否仍是先前认识的同一主体”。名称合法转让后，新持有者可以通过 mTLS 名称认证，但其 `SubjectId` 会变化；已有联系人上的 allow 随即降级为 review。承载应用 MUST 从已验证的远端证书构造 `Visitor`，不得从可伪造的应用层字段构造它。
 
-### 13.3 RequestId 派生
+### 13.3 内部 Request ID 派生
 
-RequestId 是请求方按本节算法生成并选择是否携带的 64 字符小写十六进制 SHA-256 摘要。服务器不得为每个入站请求自动补充 RequestId；它只在请求已经携带 RequestId 时重新计算并验证。
+Request ID 是服务端生成的 64 字符小写十六进制 SHA-256 摘要。它不通过 HTTP 传输，调用方不得提供、选择或覆盖它。
 
 输入由以下部分组成：
 
@@ -804,9 +787,9 @@ RequestId 是请求方按本节算法生成并选择是否携带的 64 字符小
 3. mTLS 验证的来访者名称；
 4. 来访者证书 SKI 中的 `SubjectId`。
 
-伪头部和普通 header 先按名称、再按值的字节序排序。每个名称和值使用 64 位大端长度前缀后输入摘要；排序后的 header 集合之后，再以相同长度前缀编码来访者名称和 `SubjectId`。该编码避免字段拼接歧义，并使 header 到达顺序不影响结果。请求 body 当前不参与 RequestId。
+伪头部和普通 header 先按名称、再按值的字节序排序。每个名称和值使用 64 位大端长度前缀后输入摘要；排序后的 header 集合之后，再以相同长度前缀编码来访者名称和 `SubjectId`。该编码避免字段拼接歧义，并使 header 到达顺序不影响结果。请求 body 当前不参与 request ID。
 
-RequestId 的传输字段本身独立于参与摘要的普通 header 集合，不参与自身摘要。因为来访者名称和 `SubjectId` 均参与计算，同一个 RequestId 无法合法用于其他主体或其他请求。没有携带 RequestId 的请求不执行这项计算，只能进入 live 审批。
+因为 visitor 名称和 `SubjectId` 均参与计算，审批决定无法被另一身份消费。调用方在状态变为 `allowed` 后必须重试相同请求字段，才能命中并消费该一次性决定。
 
 ### 13.4 审批重放
 
@@ -853,9 +836,9 @@ header 或路径中声明的联系人名称。实现必须复核保存的 Subjec
 6. 本地批准直接写为 Active，不建立对端通知、重试任务或连接等待；
 7. `/contact/self` 只允许同名且 SubjectId 完全匹配的已验证 visitor 读取自身状态和 Active 时的本地精确授权；
 8. 冻结状态拒绝重复申请且保持申请时间戳，只有 Active/Transfered 接受资料更新；删除记录后允许重新申请；
-9. live 与 persistent 列表均正确分页，重叠记录只显示在 live；
-10. live 审批删除重叠的 persistent 记录，persistent 审批不反向操作 live；
-11. 持久决定只能被完全匹配的请求消费一次；
+9. review pending 列表正确分页，且只包含未过期记录；
+10. review 立即返回 `202`，不保留连接、Future/Waker 或内存等待者；
+11. review 状态查询只允许创建该 review 的已验证 visitor，且 allow/deny 决定只能被完全匹配的请求消费一次；
 12. `/acl` 管理 API 的规则变更和联系人删除不会移除最后一位 allow 管理员，普通业务 API 不受这项限制。
 
 ## 16. IANA 考虑
