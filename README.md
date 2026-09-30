@@ -15,7 +15,7 @@
 - 按 API 路径最长匹配规则，支持指定 method 或 `*`。
 - 支持精确联系人、所有已命名来访者、匿名来访者和所有来访者等 grantee。
 - 联系人申请、批准、权限同步、拉黑和恢复。
-- 实时审批，以及绑定 RequestId 的持久审批。
+- 异步持久审批：业务请求立即返回 `202 Accepted`，由调用方查询状态后重试。
 - SQLite 持久化与内存 Policies 一致性更新。
 - 可直接挂载到 Axum Router 的管理 API。
 
@@ -75,7 +75,8 @@ request.extensions_mut().insert(visitor.clone());
 将当前请求转换为 `Headers`，再调用 `AccessService::auth`：
 
 ```rust
-use access_control::{AuthResult, Headers};
+use access_control::{AuthResult, Headers, PendingReviewResponse};
+use axum::{Json, http::StatusCode};
 
 let headers = Headers {
     method: request.method().clone(),
@@ -84,7 +85,6 @@ let headers = Headers {
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), |value| value.as_str().to_owned()),
     fields: request.headers().clone(),
-    request_id,
 };
 
 match acl
@@ -93,35 +93,16 @@ match acl
 {
     AuthResult::Allowed => next.run(request).await,
     AuthResult::Denied => forbidden_response(),
-    AuthResult::Reviewing(id, state, reviews) => {
-        let decision = state.await;
-        reviews.del(id);
-        match decision {
-            Ok(access_control::Action::Allow) => next.run(request).await,
-            Ok(access_control::Action::Deny) | Err(_) => forbidden_response(),
-        }
-    }
+    AuthResult::Reviewing(review) => (
+        StatusCode::ACCEPTED,
+        Json(PendingReviewResponse::from(review)),
+    ).into_response(),
 }
 ```
 
-匿名请求必须同时传入 `None, None`；名称与 SubjectId 只能同时存在或同时缺失。若请求携带 RequestId，适配层应把它放入 `Headers::request_id`；服务会重新计算并验证，不能由服务器替请求自动生成。
+匿名请求必须同时传入 `None, None`；名称与 SubjectId 只能同时存在或同时缺失。匿名请求命中 `review` 时会被拒绝。服务端为已验证 visitor 从 method、path、普通 headers 和 SubjectId 派生内部 request ID，调用方不传入或覆盖该值。
 
-当传输层能够感知 request reset 时，应同时等待审批和取消信号：
-
-```rust
-tokio::select! {
-    decision = state.clone() => {
-        reviews.del(id);
-        // 根据 decision 继续或拒绝请求
-    }
-    _ = request_cancelled() => {
-        state.cancel();
-        reviews.del(id);
-    }
-}
-```
-
-删除 Registry 项不会使已经持有的 `ArcReviewState` 失效，因此取消时应先调用 `cancel()` 唤醒等待者，再删除 Registry 项。
+`202` 中的 `status_url` 只允许同一已验证 visitor 查询。查询结果为 `pending`、`allowed`、`denied` 或 `expired`；状态为 `allowed` 时，调用方使用相同请求字段重试原业务请求，allow/deny 决定会被一次性消费。状态端点必须在常规业务 ACL 之外路由，但 handler 必须执行这一行级身份校验，避免查询本身再次进入审批。
 
 ### 4. 挂载管理 API
 
@@ -140,7 +121,7 @@ let application = application.layer(your_access_control_middleware(acl.clone()))
 
 - `/contact`、`/contact/self`、`/contact/{name}`、`/contacts`：联系人申请、申请方状态查询和管理；
 - `/acl/apis`、`/acl/access`、`/acl/allow`：权限规则管理；
-- `/acl/review`、`/acl/reviews/live`、`/acl/reviews/persistent`：审批管理。
+- `/acl/review`、`/acl/reviews`：审批管理；`/acl/review/{id}/status`：发起方状态查询。
 
 具体 method、请求体和响应体见 [SPEC.md 的 HTTP API 章节](SPEC.md#10-http-api)。
 

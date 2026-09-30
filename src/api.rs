@@ -8,7 +8,7 @@ use axum::{Router, routing::get};
 pub use contact::{
     ContactPatch, ContactRecord, GrantedAccess, GrantedMethods, NewContact, RequestedAccess,
 };
-pub use review::{ReviewRecord, ReviewTarget};
+pub use review::ReviewRecord;
 
 use crate::AccessService;
 
@@ -42,8 +42,8 @@ pub fn router(service: Arc<AccessService>) -> Router {
                 .delete(access::delete_by_name),
         )
         .route("/acl/review", axum::routing::patch(review::decide))
-        .route("/acl/reviews/live", get(review::list_live))
-        .route("/acl/reviews/persistent", get(review::list_persistent))
+        .route("/acl/reviews", get(review::list_persistent))
+        .route("/acl/review/{id}/status", get(review::status))
         .with_state(ApiState { service })
 }
 
@@ -151,20 +151,18 @@ mod tests {
                 .status(),
             http::StatusCode::OK
         );
-        for uri in ["/acl/reviews/live", "/acl/reviews/persistent"] {
-            assert_eq!(
-                app.clone()
-                    .oneshot(
-                        http::Request::builder()
-                            .uri(uri)
-                            .body(axum::body::Body::empty())
-                            .unwrap()
-                    )
-                    .await
-                    .unwrap()
-                    .status(),
-                http::StatusCode::OK
-            );
-        }
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    http::Request::builder()
+                        .uri("/acl/reviews")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            http::StatusCode::OK
+        );
     }
 }

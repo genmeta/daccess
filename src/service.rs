@@ -8,9 +8,9 @@ use sea_orm::{
 use tokio::sync::RwLock;
 
 use crate::{
-    ArcReviewRegistry, ArcReviewState, Effect, Grantee, Headers, Method, Policies,
-    ReviewingRequest, SubjectId,
+    Effect, Grantee, Headers, Method, PendingReview, Policies, ReviewStatus, SubjectId,
     policy::{PolicyError, database_api},
+    review::RequestId,
 };
 
 pub struct AccessService {
@@ -18,7 +18,6 @@ pub struct AccessService {
     pub(crate) owner_name: String,
     pub(crate) contacts: RwLock<Trie<String, SubjectId>>,
     pub(crate) policies: RwLock<Policies>,
-    pub(crate) reviews: ArcReviewRegistry,
 }
 
 impl AccessService {
@@ -34,7 +33,6 @@ impl AccessService {
             owner_name: owner_name.into(),
             contacts: RwLock::new(Trie::new()),
             policies: RwLock::new(Policies::default()),
-            reviews: Default::default(),
         }
     }
 
@@ -116,7 +114,6 @@ impl AccessService {
             owner_name: owner_name.to_owned(),
             contacts: RwLock::new(contacts),
             policies: RwLock::new(policies),
-            reviews: Default::default(),
         })
     }
 
@@ -216,43 +213,27 @@ impl AccessService {
             ),
         };
 
-        if let Some(request_id) = &headers.request_id {
-            let Some((visitor, visitor_sid)) = name.zip(subject_id) else {
-                return Err(DbErr::Type(String::from(
-                    "an anonymous review cannot carry a RequestId",
-                )));
-            };
-            let expected = crate::RequestId::for_request(&headers, visitor, visitor_sid);
-            if request_id != &expected {
-                return Err(DbErr::Type(String::from(
-                    "RequestId does not match the authenticated request",
-                )));
-            }
-            match self
-                .persistent_review(
-                    visitor,
-                    visitor_sid,
-                    request_id.as_str(),
-                    headers.method.as_str(),
-                    &api,
-                    &reason,
-                )
-                .await?
-            {
-                ReviewStatus::Allowed => return Ok(AuthResult::Allowed),
-                ReviewStatus::Denied => return Ok(AuthResult::Denied),
-                ReviewStatus::Pending => {}
-            }
+        let Some((visitor, visitor_sid)) = name.zip(subject_id) else {
+            // A review must be queryable only by the authenticated subject that
+            // initiated it. Anonymous review requests therefore fail closed.
+            return Ok(AuthResult::Denied);
+        };
+        let request_id = RequestId::for_request(&headers, visitor, visitor_sid);
+        match self
+            .persistent_review(
+                visitor,
+                visitor_sid,
+                request_id.as_str(),
+                headers.method.as_str(),
+                &api,
+                &reason,
+            )
+            .await?
+        {
+            StoredReviewStatus::Allowed => Ok(AuthResult::Allowed),
+            StoredReviewStatus::Denied => Ok(AuthResult::Denied),
+            StoredReviewStatus::Pending(id) => Ok(AuthResult::Reviewing(PendingReview::new(id))),
         }
-
-        let request = ReviewingRequest::new(
-            headers,
-            name.map(str::to_owned),
-            subject_id.cloned(),
-            reason,
-        );
-        let (id, state) = self.reviews.add(request);
-        Ok(AuthResult::Reviewing(id, state, self.reviews.clone()))
     }
 
     async fn persistent_review(
@@ -263,7 +244,7 @@ impl AccessService {
         method: &str,
         api: &str,
         reason: &str,
-    ) -> Result<ReviewStatus, DbErr> {
+    ) -> Result<StoredReviewStatus, DbErr> {
         let transaction = self.db.begin().await?;
         let decided = transaction
             .query_one_raw(Statement::from_sql_and_values(
@@ -285,8 +266,8 @@ impl AccessService {
             .await?;
         if let Some(row) = decided {
             let review = match i32::try_get(&row, "", "stage")? {
-                1 => ReviewStatus::Allowed,
-                2 => ReviewStatus::Denied,
+                1 => StoredReviewStatus::Allowed,
+                2 => StoredReviewStatus::Denied,
                 stage => {
                     return Err(DbErr::Type(format!(
                         "invalid persistent review stage {stage}"
@@ -300,7 +281,7 @@ impl AccessService {
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
-                r#"SELECT visitor_sid, method, api, stage,
+                r#"SELECT id, visitor_sid, method, api, stage,
                           CASE WHEN expired_after > CAST(strftime('%s', 'now') AS INTEGER)
                                THEN 1 ELSE 0 END AS valid
                    FROM access_reviews
@@ -310,8 +291,8 @@ impl AccessService {
             .await?;
 
         let Some(row) = row else {
-            transaction
-                .execute_raw(Statement::from_sql_and_values(
+            let row = transaction
+                .query_one_raw(Statement::from_sql_and_values(
                     DatabaseBackend::Sqlite,
                     r#"INSERT INTO access_reviews
                        (request_id, visitor, visitor_sid, method, api, stage, reason,
@@ -319,7 +300,8 @@ impl AccessService {
                        VALUES (?, ?, ?, ?, ?, 0, ?,
                                CAST(strftime('%s', 'now', '+1 day') AS INTEGER),
                                CAST(strftime('%s', 'now') AS INTEGER),
-                               CAST(strftime('%s', 'now') AS INTEGER))"#,
+                               CAST(strftime('%s', 'now') AS INTEGER))
+                       RETURNING id"#,
                     [
                         request_id.into(),
                         visitor.into(),
@@ -330,15 +312,21 @@ impl AccessService {
                     ],
                 ))
                 .await?;
+            let id = i64::try_get(
+                &row.expect("INSERT ... RETURNING always returns the inserted row"),
+                "",
+                "id",
+            )?;
             transaction.commit().await?;
-            return Ok(ReviewStatus::Pending);
+            return Ok(StoredReviewStatus::Pending(id));
         };
 
+        let id = i64::try_get(&row, "", "id")?;
         let stored_method = String::try_get(&row, "", "method")?;
         let stored_api = String::try_get(&row, "", "api")?;
         if stored_method != method || stored_api != api {
             return Err(DbErr::Type(format!(
-                "RequestId {request_id:?} for {visitor:?} is already bound to {stored_method} {stored_api}"
+                "request ID for {visitor:?} is already bound to {stored_method} {stored_api}"
             )));
         }
 
@@ -347,14 +335,14 @@ impl AccessService {
         let stored_sid = Vec::<u8>::try_get(&row, "", "visitor_sid")?;
         if valid && stored_sid != visitor_sid.as_bytes() {
             return Err(DbErr::Type(format!(
-                "RequestId {request_id:?} for {visitor:?} is already bound to another subject_id"
+                "request ID for {visitor:?} is already bound to another subject_id"
             )));
         }
         let review = if valid {
             match stage {
-                0 => ReviewStatus::Pending,
-                1 => ReviewStatus::Allowed,
-                2 => ReviewStatus::Denied,
+                0 => StoredReviewStatus::Pending(id),
+                1 => StoredReviewStatus::Allowed,
+                2 => StoredReviewStatus::Denied,
                 _ => {
                     return Err(DbErr::Type(format!(
                         "invalid persistent review stage {stage}"
@@ -371,16 +359,15 @@ impl AccessService {
                            reason = ?,
                            expired_after = CAST(strftime('%s', 'now', '+1 day') AS INTEGER),
                            updated_at = CAST(strftime('%s', 'now') AS INTEGER)
-                       WHERE visitor = ? AND request_id = ?"#,
+                       WHERE id = ?"#,
                     [
                         visitor_sid.as_bytes().to_vec().into(),
                         reason.into(),
-                        visitor.into(),
-                        request_id.into(),
+                        id.into(),
                     ],
                 ))
                 .await?;
-            ReviewStatus::Pending
+            StoredReviewStatus::Pending(id)
         };
 
         transaction.commit().await?;
@@ -391,8 +378,37 @@ impl AccessService {
         &self.db
     }
 
-    pub fn reviews(&self) -> &ArcReviewRegistry {
-        &self.reviews
+    pub async fn review_status(
+        &self,
+        id: i64,
+        visitor: &str,
+        subject_id: &SubjectId,
+    ) -> Result<ReviewStatus, DbErr> {
+        let row = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT stage, expired_after > CAST(strftime('%s', 'now') AS INTEGER) AS valid \
+                 FROM access_reviews WHERE id = ? AND visitor = ? AND visitor_sid = ?",
+                [
+                    id.into(),
+                    visitor.into(),
+                    subject_id.as_bytes().to_vec().into(),
+                ],
+            ))
+            .await?
+            .ok_or_else(|| DbErr::RecordNotFound(format!("review {id}")))?;
+        if i32::try_get(&row, "", "valid")? == 0 {
+            return Ok(ReviewStatus::Expired);
+        }
+        match i32::try_get(&row, "", "stage")? {
+            0 => Ok(ReviewStatus::Pending),
+            1 => Ok(ReviewStatus::Allowed),
+            2 => Ok(ReviewStatus::Denied),
+            stage => Err(DbErr::Type(format!(
+                "invalid persistent review stage {stage}"
+            ))),
+        }
     }
 }
 
@@ -400,12 +416,12 @@ impl AccessService {
 pub enum AuthResult {
     Allowed,
     Denied,
-    Reviewing(u64, ArcReviewState, ArcReviewRegistry),
+    Reviewing(PendingReview),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReviewStatus {
-    Pending,
+enum StoredReviewStatus {
+    Pending(i64),
     Allowed,
     Denied,
 }
@@ -422,24 +438,12 @@ mod tests {
 
     use super::*;
 
-    fn headers(method: http::Method, path: &str, request_id: Option<&str>) -> Headers {
+    fn headers(method: http::Method, path: &str) -> Headers {
         Headers {
             method,
             path: path.to_owned(),
             fields: http::HeaderMap::new(),
-            request_id: request_id.map(crate::RequestId::new),
         }
-    }
-
-    fn persistent_headers(
-        method: http::Method,
-        path: &str,
-        visitor: &str,
-        subject_id: &SubjectId,
-    ) -> Headers {
-        let mut headers = headers(method, path, None);
-        headers.request_id = Some(crate::RequestId::for_request(&headers, visitor, subject_id));
-        headers
     }
 
     async fn service() -> AccessService {
@@ -724,7 +728,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/contacts", None),
+                    headers(http::Method::GET, "/contacts"),
                     Some("me.example"),
                     Some(&SubjectId::new([1]).unwrap())
                 )
@@ -735,7 +739,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/contacts", None),
+                    headers(http::Method::GET, "/contacts"),
                     Some("other.example"),
                     Some(&SubjectId::new([2]).unwrap())
                 )
@@ -746,7 +750,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/contacts", None),
+                    headers(http::Method::GET, "/contacts"),
                     Some("me.example"),
                     Some(&SubjectId::new([2]).unwrap())
                 )
@@ -918,7 +922,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/acl/apis", None),
+                    headers(http::Method::GET, "/acl/apis"),
                     Some("me.example"),
                     Some(&subject_id),
                 )
@@ -1078,11 +1082,7 @@ mod tests {
 
         let get = service
             .auth(
-                headers(
-                    http::Method::GET,
-                    "/files/private/report?download=true",
-                    None,
-                ),
+                headers(http::Method::GET, "/files/private/report?download=true"),
                 Some("alice.example"),
                 Some(&SubjectId::new([1]).unwrap()),
             )
@@ -1090,7 +1090,7 @@ mod tests {
             .unwrap();
         let post = service
             .auth(
-                headers(http::Method::POST, "/files/private/report", None),
+                headers(http::Method::POST, "/files/private/report"),
                 Some("alice.example"),
                 Some(&SubjectId::new([1]).unwrap()),
             )
@@ -1121,12 +1121,7 @@ mod tests {
 
         let result = service
             .auth(
-                persistent_headers(
-                    http::Method::GET,
-                    "/profile",
-                    "alice.example",
-                    &SubjectId::new([2]).unwrap(),
-                ),
+                headers(http::Method::GET, "/profile"),
                 Some("alice.example"),
                 Some(&SubjectId::new([2]).unwrap()),
             )
@@ -1154,7 +1149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_without_request_id_is_not_persisted() {
+    async fn review_is_persisted_without_a_caller_supplied_request_id() {
         let service = service().await;
         service
             .set_policy(
@@ -1168,7 +1163,7 @@ mod tests {
 
         let result = service
             .auth(
-                headers(http::Method::POST, "/deploy/task", None),
+                headers(http::Method::POST, "/deploy/task"),
                 Some("alice.example"),
                 Some(&SubjectId::new([1]).unwrap()),
             )
@@ -1185,11 +1180,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(i64::try_get(&row, "", "count").unwrap(), 0);
+        assert_eq!(i64::try_get(&row, "", "count").unwrap(), 1);
     }
 
     #[tokio::test]
-    async fn request_id_review_is_persisted_and_registered() {
+    async fn identical_review_requests_reuse_one_persistent_record() {
         let service = service().await;
         service
             .set_policy(
@@ -1201,18 +1196,12 @@ mod tests {
             .await
             .unwrap();
 
-        let request_headers = persistent_headers(
-            http::Method::POST,
-            "/deploy/task",
+        let request_headers = headers(http::Method::POST, "/deploy/task");
+        let request_id = RequestId::for_request(
+            &request_headers,
             "alice.example",
             &SubjectId::new([1]).unwrap(),
         );
-        let request_id = request_headers
-            .request_id
-            .as_ref()
-            .unwrap()
-            .as_str()
-            .to_owned();
         let result = service
             .auth(
                 request_headers,
@@ -1221,19 +1210,26 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(result, AuthResult::Reviewing(..)));
+        let review_id = match result {
+            AuthResult::Reviewing(review) => review.id(),
+            _ => panic!("expected pending review"),
+        };
 
         let row = service
             .db
             .query_one_raw(Statement::from_string(
                 DatabaseBackend::Sqlite,
-                "SELECT request_id, visitor, visitor_sid, method, api, stage, reason \
+                "SELECT id, request_id, visitor, visitor_sid, method, api, stage, reason \
                  FROM access_reviews",
             ))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(String::try_get(&row, "", "request_id").unwrap(), request_id);
+        assert_eq!(i64::try_get(&row, "", "id").unwrap(), review_id);
+        assert_eq!(
+            String::try_get(&row, "", "request_id").unwrap(),
+            request_id.as_str()
+        );
         assert_eq!(
             String::try_get(&row, "", "visitor").unwrap(),
             "alice.example"
@@ -1250,33 +1246,18 @@ mod tests {
             "matched review rule: POST /deploy **"
         );
 
-        let mut reused = headers(http::Method::POST, "/deploy/other", None);
-        reused.request_id = Some(crate::RequestId::new(request_id.clone()));
-        assert!(
-            service
-                .auth(
-                    reused,
-                    Some("alice.example"),
-                    Some(&SubjectId::new([1]).unwrap()),
-                )
-                .await
-                .is_err()
-        );
-
         let retry = service
             .auth(
-                persistent_headers(
-                    http::Method::POST,
-                    "/deploy/task",
-                    "alice.example",
-                    &SubjectId::new([1]).unwrap(),
-                ),
+                headers(http::Method::POST, "/deploy/task"),
                 Some("alice.example"),
                 Some(&SubjectId::new([1]).unwrap()),
             )
             .await
             .unwrap();
-        assert!(matches!(retry, AuthResult::Reviewing(..)));
+        assert!(matches!(
+            retry,
+            AuthResult::Reviewing(review) if review.id() == review_id
+        ));
 
         let count = service
             .db
@@ -1302,13 +1283,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let request_headers = persistent_headers(
-            http::Method::POST,
-            "/deploy",
+        let request_headers = headers(http::Method::POST, "/deploy");
+        let request_id = RequestId::for_request(
+            &request_headers,
             "alice.example",
             &SubjectId::new([1]).unwrap(),
         );
-        let request_id = request_headers.request_id.as_ref().unwrap().as_str();
         service
             .db
             .execute_raw(Statement::from_sql_and_values(
@@ -1321,7 +1301,7 @@ mod tests {
                     CAST(strftime('%s', 'now', '+1 day') AS INTEGER),
                     CAST(strftime('%s', 'now') AS INTEGER),
                     CAST(strftime('%s', 'now') AS INTEGER))"#,
-                [request_id.into()],
+                [request_id.as_str().into()],
             ))
             .await
             .unwrap();
