@@ -128,9 +128,9 @@ tokio::select! {
 管理 Router 应和业务 Router 合并后，再整体套上访问控制中间件。这样 `/contact` 和 `/acl` 自身也会受到同一个 `AccessService` 的规则约束：
 
 ```rust
-use access_control::management_router_with_notifier;
+use access_control::management_router;
 
-let application = management_router_with_notifier(acl.clone(), notifier)
+let application = management_router(acl.clone())
     .fallback_service(business_router);
 
 let application = application.layer(your_access_control_middleware(acl.clone()));
@@ -138,37 +138,22 @@ let application = application.layer(your_access_control_middleware(acl.clone()))
 
 主要端点包括：
 
-- `/contact`、`/contact/{name}`、`/contacts`：联系人申请和管理；
+- `/contact`、`/contact/self`、`/contact/{name}`、`/contacts`：联系人申请、申请方状态查询和管理；
 - `/acl/apis`、`/acl/access`、`/acl/allow`：权限规则管理；
 - `/acl/review`、`/acl/reviews/live`、`/acl/reviews/persistent`：审批管理。
 
 具体 method、请求体和响应体见 [SPEC.md 的 HTTP API 章节](SPEC.md#10-http-api)。
 
-### 5. 实现联系人通知器
+### 5. 联系人状态拉取
 
-本地管理员批准联系人时，需要向对端发送 `PATCH https://{contact}/contact`。承载应用通过 `ContactNotifier` 提供传输实现：
+本地管理员批准联系人只写入本 profile 的状态并立即返回；pishoo 不会向对端建立
+连接、维护重试或判断对方是否在线。发送方 pishoo 将申请保存到本地队列并重试投递；
+接收方以实际收到时间设定 7 天有效期。申请方以后通过已认证的 DHTTP 请求调用
+`GET /contact/self?application_id=...` 拉取该申请状态和当前精确授权。
 
-```rust
-use access_control::{ContactNotifier, NotifyError};
-use std::{future::Future, pin::Pin};
-
-impl ContactNotifier for MyNotifier {
-    fn granted_update<'a>(
-        &'a self,
-        contact: &'a str,
-        modified_since: i64,
-        body: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>> {
-        Box::pin(async move {
-            // 通过已认证的 DHTTP/mTLS 连接发送 PATCH /contact。
-            // If-Modified-Since 使用 modified_since，JSON 请求体直接使用 body。
-            send_granted_update(contact, modified_since, body).await
-        })
-    }
-}
-```
-
-不需要联系人同步时可以使用 `management_router(acl)`；此时需要远端通知的批准操作会返回 503。pishoo 的 DHTTP 实现见 [`pishoo/src/service/snapshot.rs`](../pishoo/src/service/snapshot.rs)。
+该端点不接受联系人名称参数。承载应用必须先从 mTLS/DHTTP 连接构造 `Visitor`，
+再允许端点绕过常规业务 ACL；handler 会用该 Visitor 的 name 和 SubjectId 校验
+申请编号归属。因此它不能被用于枚举其他联系人的申请，也不会暴露管理端详情。
 
 ## 直接管理规则
 

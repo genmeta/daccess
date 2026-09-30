@@ -1,12 +1,12 @@
 # Access Control 数据模型与管理协议
 
-## 实现规范，版本 0
+## 实现规范，版本 1
 
 ### 文档状态
 
 本文档描述 `access_control` crate 当前实现的数据模型、授权算法和 HTTP 管理接口。它采用 IETF RFC 常见的组织方式与规范性语言，但不是 IETF 提案或互联网标准。
 
-本文档以数据库 migration 0 及当前公开 API 为准。除非明确标记为“扩展点”或“安全考虑”，本文描述的是已经实现的行为，而不是未来规划。
+本文档以数据库 schema version 1 及当前公开 API 为准。除非明确标记为“扩展点”或“安全考虑”，本文描述的是已经实现的行为，而不是未来规划。
 
 ## 摘要
 
@@ -80,10 +80,10 @@
 联系人中的两个权限字段具有不同方向：
 
 - `requests`：对方希望本方开放的权限；
-- `grants`：对方已经向本方开放的权限；
-- `offers`：联系人申请方承诺在合法批准回调后向接收方开放、但当前尚未生效的权限。
+- `grants`：保留的历史字段；当前拉取协议不写入它；
+- `offers`：联系人申请方可展示的待授予声明，或拉黑时保存的本地规则快照。
 
-本方管理员批准对方请求时，应先在 `access_rules` 中建立最终规则，再执行联系人 `local_approval`。批准过程会从规则表收集该联系人的实际授权，并通过通知器发送给对方。系统 MUST NOT 将管理员审批结果重复存入联系人 `grants` 字段。
+本方管理员批准对方请求时，应先在 `access_rules` 中建立最终规则，再将联系人状态更新为 Active。申请方随后通过 `GET /contact/self` 拉取自身状态和当前精确授权。系统 MUST NOT 将管理员审批结果重复存入联系人 `grants` 字段，也不得依赖对端在线或建立出站连接。
 
 这种分离消除了两个本地事实来源之间的同步竞争，并允许 `deny`、组规则、匿名规则等并不属于联系人声明的规则正常存在。
 
@@ -99,7 +99,7 @@
 
 数据库中的 `created_at`、`updated_at` 和 `expired_after` 均为 SQLite `INTEGER`，值为 UTC Unix 时间戳，单位为秒。
 
-使用整数的原因是避免文本时间的解析、排序和时区歧义，并使范围查询及索引比较保持数值语义。联系人 POST/响应中的三个时间使用 Unix 秒；联系人 PATCH 的 `If-Modified-Since` 使用标准 HTTP-date。持久审批 API 的 `expired_after` 使用 RFC 3339 日期时间字符串。
+使用整数的原因是避免文本时间的解析、排序和时区歧义，并使范围查询及索引比较保持数值语义。联系人时间由接收方生成并在响应中使用 Unix 秒；持久审批 API 的 `expired_after` 使用 RFC 3339 日期时间字符串。
 
 ### 4.2 HTTP 方法
 
@@ -154,6 +154,12 @@ API 必须是以 `/` 开头的绝对路径。除根路径 `/` 外，持久化路
 
 联系人 HTTP 请求中的 `subject_id` 是长度 1 至 64 字节的字符串；服务按该字符串的 UTF-8 字节存入 BLOB。当前接口不执行十六进制解码。DHTTP owner hash 应直接作为 64 字符字符串传递。
 
+本地管理查询 `GET /contact/{name}` 与 `GET /contacts` 中的 `subject_id` 用于展示。
+可读 UTF-8 文本按原文返回，包括 DHTTP 的 64 字符 owner hash；非 UTF-8 字节或包含控制字符的值，
+返回 `hex:` 前缀加原始字节的小写十六进制，例如字节 `00 80 ff 41` 返回 `hex:0080ff41`。
+管理查询不得使用有损 UTF-8 解码生成替换字符。该展示形式不用于身份认证、主体比较或联系人交换，
+数据库和授权判断始终使用原始字节。
+
 ## 5. 数据库规范
 
 ### 5.1 模块版本表
@@ -162,16 +168,16 @@ API 必须是以 `/` 开头的绝对路径。除根路径 `/` 外，持久化路
 
 ```text
 module_name = access
-version     = 0
+version     = 1
 license     = Apache-2.0
 ```
 
 服务启动时：
 
-1. 若不存在 `module` 表，则在事务中执行 migration 0；
-2. 若存在，则读取当前版本并按顺序执行尚未应用的 migration；
-3. 数据库版本高于当前实现支持的版本时，启动必须失败；
-4. migration 与版本更新必须位于同一事务中。
+1. 若不存在 `module` 表，则在事务中执行 `src/migrations/0.sql`，初始化基线 schema version 0；
+2. 若 `module.version` 为 0，则在新事务中执行 `src/migrations/1.sql`，创建 `contact_applications` 表并将版本更新为 1 后提交；
+3. 若 `module.version` 为 1，则直接继续初始化，不重复执行 migration；
+4. 任何其他版本必须拒绝启动。
 
 ### 5.2 `contacts`
 
@@ -186,25 +192,26 @@ license     = Apache-2.0
 | `offers`      | TEXT    | 合法 JSON object；通常保存待兑现权限，Blocked 时保存拉黑前权限快照     |
 | `requests`    | TEXT    | 合法 JSON object；对方向本方申请的权限                                |
 | `description` | TEXT    | 非 NULL 简介，最多 80 个 Unicode 字符；允许空字符串                    |
-| `status`      | INTEGER | `0..5`                                                                |
-| `expired_after` | INTEGER | 申请方指定的联系人申请失效时间，Unix 秒时间戳                       |
-| `updated_at`  | INTEGER | 申请方发送的申请更新时间，Unix 秒时间戳                               |
-| `created_at`  | INTEGER | 申请方发送的申请创建时间，Unix 秒时间戳                               |
+| `status`      | INTEGER | `0`、`2..5`                                                           |
+| `expired_after` | INTEGER | 接收方按收到时间计算的申请失效时间，Unix 秒时间戳                   |
+| `updated_at`  | INTEGER | 接收方维护的更新时间，Unix 秒时间戳                                   |
+| `created_at`  | INTEGER | 接收方记录的首次收到时间，Unix 秒时间戳                               |
 
 联系人状态为：
 
 |  值 | 名称                  | 含义                                         |
 | --: | --------------------- | -------------------------------------------- |
 |   0 | Pending | 等待建立或批准                         |
-|   1 | Syncing | 本方已批准，正在或等待向对方同步授权结果 |
-|   2 | Active  | 已激活，可继续同步权限                 |
+|   2 | Active  | 已激活；申请方可拉取本地当前授权       |
 |   3 | Transfered | 名称所代表的主体已经发生转让         |
 |   4 | Expired   | Pending 申请超过有效期且未获批准     |
 |   5 | Blocked   | 已被本方拉黑，拒绝重新申请和权限更新 |
 
-首次 HTTP 创建写入 Pending，并原样保存申请方发送的 `created_at`、`updated_at` 和 `expired_after`。接收方验证 `created_at <= updated_at < expired_after`，并按申请方指定的 `expired_after` 判断申请是否有效。Pending、Syncing、Expired 和 Blocked 的申请资料与授权资料处于冻结状态，重复 POST 必须返回冲突且不得改变时间戳。只有 Active 和 Transfered 接受后续 POST，并在保持当前状态的同时替换资料和三个时间戳。
+首次 HTTP 创建时，含权限请求的申请写入 Pending；没有请求任何权限的申请直接写入 Active，无须单独批准“联系人关系”。接收方以收到请求的时间写入 `created_at` 和 `updated_at`，并将 `expired_after` 设为收到时间后 7 天。相同 `application_id`、认证身份和载荷的重试返回原记录，不重置有效期；编号被其他身份或不同载荷复用时返回冲突。新的申请编号可在前一申请过期后重新申请；Blocked 身份不可申请。
 
-实现可以在读取或修改联系人时惰性地把 `status = Pending AND expired_after <= now` 的记录更新为 Expired。过期转换只改变状态，不改变 `updated_at`。过期记录必须保留以供审计，不得由过期处理自动删除，也不得接受本地批准。唯一的补偿例外是来自申请接收方的批准 PATCH：若其 `If-Modified-Since` 严格早于记录的 `expired_after`，申请方即使已显示 Expired 也必须接受该批准并转为 Active。
+`contact_applications` 按 `application_id` 保存认证申请人名称与 SubjectId、载荷摘要、收到时间、失效时间和 pending/active/expired/denied/revoked 状态。它与联系人写入在同一事务中完成，并在联系人删除后保留供幂等重试和状态查询。删除待处理联系人将对应申请标记 denied；删除已激活联系人标记 revoked。
+
+实现可以在读取或修改联系人时惰性地把 `status = Pending AND expired_after <= now` 的记录更新为 Expired。过期转换只改变状态，不改变 `updated_at`。过期记录必须保留以供审计，不得由过期处理自动删除，也不得接受本地批准。
 
 删除联系人后，数据库触发器必须删除所有以该联系人名称为精确 grantee 的规则。服务随后同步清理内存联系人索引和策略树。
 
@@ -393,58 +400,27 @@ persistent 项只有在没有对应 live 项时才会显示和被审批，因此
 
 ### 9.3 创建联系人
 
-首次创建联系人时，状态固定为 Pending。`description` 是申请方随请求发送的简介，不得超过 80 个 Unicode 字符。申请方同时发送 `created_at`、`updated_at` 和 `expired_after`，接收方保存这些时间并按 `expired_after` 判断有效性。
-
-申请有效期不宜过短，以免正常的离线、网络延迟或人工处理时间导致申请过早失效；也不宜过长，以免扩大未决申请和延迟批准的风险窗口。申请方 SHOULD 使用 3 天作为默认和建议有效期，并 SHOULD NOT 设置超过 7 天的有效期。
+首次创建联系人时，含权限请求的状态为 Pending；没有请求任何权限时直接成为 Active。`description` 是申请方随请求发送的简介，不得超过 80 个 Unicode 字符。接收方以实际收到时间为起点计算 7 天有效期。申请方不提交时间或有效期。
 
 虽然两个权限映射在 JSON 语法上可以省略，但申请方 SHOULD 同时发送自身请求的权限和承诺向对方开放的权限。申请方发送的 `offers` 可以为空对象。
 
-申请方在向对方发送 POST 之前，MUST 先为该对方名称写入精确的回调规则：方法为 PATCH，API 为 `/contact`，effect 为 allow。该回调规则是联系人建立协议的引导权限，不代表联系人已经获得其他业务 API 权限；即使申请进入 Expired，回调规则也 MUST 保留，以支持第 9.5 节的延迟批准补偿。
+联系人申请不产生任何回调或业务访问规则。申请方提供的 `offers` 仅是声明，不会在发送 POST 时写入 `access_rules`。申请方获批后，应由其自身在合适时机重新查询对方；对方也不负责确认申请方是否在线。
 
-除回调端点外，申请方承诺开放的其他权限在申请期间只是待授予权限。申请方 MUST 保存这份待授予权限，但 MUST NOT 在发送 POST 时提前写入生效的 `access_rules`。只有收到并接受第 9.5 节的 PATCH 后，才将整份待授予权限正式授予对方。
-
-创建联系人时，系统统一写入该联系人对固定 `PATCH /contact` 端点的 allow 回调规则；无论联系人记录来自本地发起申请还是远端 POST，都不使用绕过回调规则的创建路径。该操作不会提前应用 `offers` 中承诺的业务访问规则。
-
-同名记录处于 Pending、Syncing、Expired 或 Blocked 时，POST MUST 返回 409，且数据库、联系人 trie 和三个时间戳 MUST 保持不变。处于 Active 或 Transfered 时，POST 可以替换 `subject_id`、`class`、`description`、`requests`、`offers` 和三个时间戳，但 MUST 保持原状态。删除联系人会删除整条记录及该联系人作为精确 grantee 的全部权限规则；记录不存在后，同名主体可以重新申请并创建新的 Pending 记录。联系人只能从 Active 或 Transfered 变为 Blocked；Pending、Syncing 和 Expired 都不得被拉黑。拉黑事务 MUST 将该联系人当前的全部精确权限规则保存到 `offers`，删除这些生效规则，再为该联系人明确写入 `POST /contact` 和 `PATCH /contact` 的 deny 规则。
+同名记录仍处于 Pending 时，新编号的 POST 返回 409；相同编号和载荷的重试返回原状态。Expired 允许新编号重新申请，Blocked 返回 409。处于 Active 或 Transfered 时，新的申请可更新资料并保持联系人状态。删除联系人会删除整条联系人及其精确规则，但保留申请审计记录。联系人只能从 Active 或 Transfered 变为 Blocked；Pending 和 Expired 都不得被拉黑。拉黑事务 MUST 将该联系人当前的全部精确权限规则保存到 `offers`，删除这些生效规则，再为该联系人明确写入 `POST /contact` 的 deny 规则。
 
 ### 9.4 本地批准
 
-具有 `PATCH /contact/{name}` allow 权限的本地管理员发起批准时，顺序具有事务外的远端依赖：
+具有 `PATCH /contact/{name}` allow 权限的本地管理员批准时，系统必须验证联系人为未过期的 Pending 或 Transfered，随后在本地事务中直接将状态更新为 Active。该操作不访问网络、不等待对端、也不更新 `grants` 或 `offers`。对方上线后自行发起第 9.5 节的状态查询。
 
-1. 验证联系人存在且状态为未过期的 Pending、Syncing、Active 或 Transfered；过期的 Pending 必须先转为 Expired 并拒绝批准；
-2. 将 Pending、Active 或 Transfered 写为 Syncing；Syncing 表示重试，不改变状态；所有转换均保持申请方时间戳不变；
-3. 从 `access_rules` 收集该联系人作为精确 grantee 的全部 allow、review 和 deny 规则；
-4. 通过 `ContactNotifier` 向对方发送授权更新；
-5. 仅在通知成功后，将本地 `offers` 记为对方已经兑现的 `grants`，清空 `offers`，并把联系人状态更新为 Active。
+### 9.5 申请方状态查询
 
-通知不可用时返回 503；对端通知失败时返回 502；两种情况下本地状态保持 Syncing。有该 API allow 权限的管理员可以对同一联系人再次发起 PATCH，重新收集当前规则并重试通知。
+申请方使用已认证的 DHTTP/mTLS 身份发起 `GET /contact/self?application_id={id}`。端点按编号查找持久申请记录，并验证申请人名称和 SubjectId 与 Visitor 完全一致；不接受调用者提交的身份字段。无编号的查询仍返回当前联系人状态。
 
-通知不构成分布式事务：对方已成功处理通知、但本地数据库随后写入失败时，双方可能暂时不一致。调用方 SHOULD 使用幂等重试；对端授权更新对 Pending、Expired 补偿、Active 和 Transfered 可重复应用。
-
-当前 pishoo 集成通过已建立的 DHTTP 连接向以下固定地址发送通知：
-
-```text
-PATCH https://{contact}/contact
-Content-Type: application/json
-If-Modified-Since: <stored updated_at as HTTP-date>
-```
-
-请求体为第 10.2 节定义的 `granted_access`。接收方不依赖路径参数或额外的 `kind` 字段，而是使用 mTLS 已认证的来访者名称查找对应联系人。
-
-### 9.5 对端授权更新
-
-收到 `PATCH /contact` 时，本方使用 mTLS 已认证的来访者名称查找联系人并将请求识别为对端授权更新。请求必须携带 `If-Modified-Since`，其值是对端保存的本申请 `updated_at`。
-
-- Pending：当请求头时间严格早于 `expired_after` 时接受，并转为 Active；
-- Expired：适用相同判断，作为对端离线期间批准的补偿接受；
-- Active 或 Transfered：接受授权更新，结果为 Active；
-- Syncing 或 Blocked：拒绝更新。
-
-成功接受 PATCH 时，申请方 MUST 在同一数据库事务中将先前保存的待授予权限写入该联系人的 `access_rules`，再替换 `grants`、清空 `offers` 并把状态更新为 Active。内存策略树 MUST 在事务提交后同步更新。该过程不改变申请方的三个时间戳。请求头时间大于或等于 `expired_after` 时，不得触发 Pending/Expired 补偿，也不得授予任何待授予权限。
+响应只包含联系人 `status` 和 `granted_access`。状态不是 Active 时 `granted_access` 必须为空；Active 时它从本方当前 `access_rules` 中收集该精确名称的 allow、review 和 deny 规则。因此返回值始终反映本方本地授权，不承诺申请方在离线期间已经处理该结果。
 
 ### 9.6 拉黑与恢复
 
-本地管理员只可将 Active 或 Transfered 联系人改为 Blocked。该操作 MUST 在同一事务中完成以下步骤：将联系人现有的全部精确规则按 `GrantedAccess` 结构写入 `offers`；删除这些规则；写入该联系人对 `POST /contact` 和 `PATCH /contact` 的 deny 规则；将状态改为 Blocked。若删除原规则会使任一 `/acl` 管理 API 不再具有至少一位 allow 管理员，整个事务必须失败。
+本地管理员只可将 Active 或 Transfered 联系人改为 Blocked。该操作 MUST 在同一事务中完成以下步骤：将联系人现有的全部精确规则按 `GrantedAccess` 结构写入 `offers`；删除这些规则；写入该联系人对 `POST /contact` 的 deny 规则；将状态改为 Blocked。若删除原规则会使任一 `/acl` 管理 API 不再具有至少一位 allow 管理员，整个事务必须失败。
 
 取消拉黑只允许 `Blocked -> Active`。实现 MUST 删除拉黑 deny 规则，从 `offers` 恢复原 allow、review 和 deny 规则，清空 `offers`，再将状态改为 Active。数据库提交后必须以同样顺序更新内存策略树。
 
@@ -477,8 +453,7 @@ If-Modified-Since: <stored updated_at as HTTP-date>
 
 ```json
 {
-  "name": "alice.example",
-  "subject_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "application_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "class": "human",
   "description": "Alice",
   "requested_access": {
@@ -490,14 +465,11 @@ If-Modified-Since: <stored updated_at as HTTP-date>
       "review": [],
       "deny": []
     }
-  },
-  "created_at": 1785800000,
-  "updated_at": 1785800060,
-  "expired_after": 1786059200
+  }
 }
 ```
 
-`class`、`requested_access` 和 `offers` 可省略并默认为空；`offers` 为空是合法的。申请方在发送 POST 前必须实际开放固定的 `PATCH /contact` 回调权限；`offers` 中的权限只暂存，等合法批准 PATCH 到达后再在事务中正式授予。`description` 必须由申请方提供，可以是空字符串，但不得超过 80 个 Unicode 字符。三个时间字段必须由申请方提供并满足 `created_at <= updated_at < expired_after`；有效期 SHOULD 遵循第 9.3 节的建议。mTLS 来访者名称和 SubjectId 必须分别等于请求体中的 `name` 和 `subject_id`。冻结状态的同名记录返回 409，Active/Transfered 记录按第 9.3 节更新。
+`application_id` 是发送方生成并在重试中保持不变的 64 位小写十六进制编号。`class`、`requested_access` 和 `offers` 可省略并默认为空；`offers` 为空是合法的。POST 不会建立回调权限或应用任何 `offers`。`description` 必填，可为空字符串，最多 80 个 Unicode 字符。请求体不接受名称、SubjectId 或时间字段；身份只来自已验证的 mTLS Visitor。首次创建返回 201，幂等重试返回 200，均返回申请编号、接收方名称与 SubjectId、状态、收到时间和到期时间。
 
 #### `GET /contacts`
 
@@ -522,7 +494,7 @@ If-Modified-Since: <stored updated_at as HTTP-date>
   "alias": "Alice",
   "class": "human",
   "description": "Alice",
-  "status": 2,
+  "status": "active",
   "created_at": 1785800000,
   "updated_at": 1785800060,
   "expired_after": 1786059200,
@@ -531,6 +503,10 @@ If-Modified-Since: <stored updated_at as HTTP-date>
   "offers": {}
 }
 ```
+
+`status` 使用 `pending`、`active`、`transfered`、`expired` 或
+`blocked`。数据库继续使用第 5.2 节定义的整数表示；整数值不属于 HTTP
+接口契约。
 
 #### `PATCH /contact/{name}`
 
@@ -543,18 +519,18 @@ If-Modified-Since: <stored updated_at as HTTP-date>
 }
 ```
 
-`status` 只接受 `syncing`、`blocked` 或 `active`：`syncing` 表示批准或重试通知；`blocked` 表示拉黑；`active` 仅用于取消拉黑。空 `alias` 表示清除本地别名。状态转换必须符合第 9.4 和 9.6 节。授权由统一访问控制层在进入联系人处理器前完成；处理器仍要求存在经过 mTLS 认证的 Visitor，但不得再额外限定其名称必须等于 `owner_name`。空对象或未知字段必须被拒绝。
+`status` 只接受 `active` 或 `blocked`：`active` 表示批准 Pending/Transfered 联系人，或取消拉黑；`blocked` 表示拉黑。空 `alias` 表示清除本地别名。状态转换必须符合第 9.4 和 9.6 节。授权由统一访问控制层在进入联系人处理器前完成；处理器仍要求存在经过 mTLS 认证的 Visitor，但不得再额外限定其名称必须等于 `owner_name`。空对象或未知字段必须被拒绝。
 
-#### `PATCH /contact`
+#### `GET /contact/self`
 
-该接口是固定的对端回调入口，不含联系人名称路径参数，也不使用 `kind` 字段。联系人名称取自 mTLS 已认证的 Visitor；请求体必须包含 `granted_access`：
-
-```http
-If-Modified-Since: Tue, 04 Aug 2026 12:00:00 GMT
-```
+申请方状态查询端点。调用者不传名称；服务从已验证的 mTLS Visitor 取得 name 和
+SubjectId。携带 `application_id` 时按申请编号返回该申请的 pending/active/expired/denied/revoked 状态、接收方身份和时间；无编号时返回当前联系人状态。Active 时包含当前精确授权：
 
 ```json
 {
+  "name": "alice.example",
+  "subject_id": "alice-subject",
+  "status": "active",
   "granted_access": {
     "/api/profile": {
       "allow": ["GET"],
@@ -564,6 +540,14 @@ If-Modified-Since: Tue, 04 Aug 2026 12:00:00 GMT
   }
 }
 ```
+
+`name` 和 `subject_id` 是服务从已验证 Visitor 返回的身份绑定字段，供出站联系人状态
+同步校验远端名称和主体是否发生变更；调用方不能提交或覆盖它们。
+
+按 `application_id` 查询时，响应中的 `name` 和 `subject_id` 改为接收方身份，供发送方校验目标；申请人身份仍只从 Visitor 验证，不能由查询参数指定。
+
+未认证调用返回 400，联系人不存在返回 404，SubjectId 与已保存联系人不匹配返回
+403。该端点在常规业务 ACL 之外由身份绑定保护，不能用作按名称查询联系人。
 
 #### `DELETE /contact/{name}`
 
@@ -828,15 +812,24 @@ RequestId 的传输字段本身独立于参与摘要的普通 header 集合，�
 
 持久 allow/deny 决定是一次性消费，并同时绑定 visitor、SubjectId、method 和 API，从而限制跨主体、跨端点重放。管理员设置的有效期仍应尽可能短。长期访问应使用可审计、可撤销的规则，而不是延长审批有效期。
 
-### 13.5 通知真实性
+### 13.5 联系人状态查询隔离
 
-`ContactNotifier` 只抽象传输，不在本模块内定义对端认证、重试或消息签名。承载应用 MUST 通过已认证的 DHTTP 通道发送联系人授权更新，并确认接收方身份与目标联系人一致。
+`GET /contact/self` 必须仅以传输层已验证的 Visitor 识别调用者，不得接受请求体、
+header 或路径中声明的联系人名称。实现必须复核保存的 SubjectId，避免名称转让后
+的新主体读取旧主体的联系人状态或规则。该工作流不建立出站 DHTTP 连接，不需要
+服务端跟踪对端在线状态、重试通知或访问对端私钥。
 
 ## 14. 兼容性与扩展
 
 ### 14.1 Schema 演进
 
-数据库版本 0 尚未发布，因此本规范涉及的 schema 调整直接收敛在 `0.sql`。首个正式发布版本之后，任何数据库结构变更才必须新增顺序 migration，并在成功执行后更新 `module.version`。实现不得静默打开高于自身支持版本的数据库。
+当前数据库 schema version 为 1。`src/migrations/0.sql` 定义基线 schema version 0，
+包含服务端内部使用的 `access_reviews.request_id` 和当前联系人状态集合；
+`src/migrations/1.sql` 新增保存申请回执的 `contact_applications` 表。
+
+服务支持将 version 0 数据库自动升级到 version 1，并直接打开 version 1 数据库。
+其他版本（包括 version 2）必须拒绝启动。后续 schema 变更以递增 migration 形式演进；
+实现不得静默打开自身不支持的数据库版本。
 
 ### 14.2 保留的扩展点
 
@@ -850,15 +843,15 @@ RequestId 的传输字段本身独立于参与摘要的普通 header 集合，�
 
 ## 15. 符合性要求
 
-声称符合本规范版本 0 的实现至少必须验证：
+声称符合本规范版本 1 的实现至少必须验证：
 
 1. schema 约束拒绝非法状态、时间类型、SubjectId 长度和规则选择器冲突；
 2. 路径按段回退，具体方法优先于 `*`，精确主体优先于类别主体；
 3. 未命中规则时拒绝，owner 默认规则在加载后生效；
 4. 数据库规则与内存策略在创建、更新和删除后保持一致；
 5. 联系人创建不产生访问规则，删除联系人清理精确规则；
-6. 本地批准在通知前进入 Syncing，通知失败可重试，通知成功才进入 Active；
-7. 对端授权更新由 mTLS 来访者身份而非 `kind` 字段识别；成功接受时正式应用待授予权限，过期补偿严格比较 `If-Modified-Since < expired_after`；
+6. 本地批准直接写为 Active，不建立对端通知、重试任务或连接等待；
+7. `/contact/self` 只允许同名且 SubjectId 完全匹配的已验证 visitor 读取自身状态和 Active 时的本地精确授权；
 8. 冻结状态拒绝重复申请且保持申请时间戳，只有 Active/Transfered 接受资料更新；删除记录后允许重新申请；
 9. live 与 persistent 列表均正确分页，重叠记录只显示在 live；
 10. live 审批删除重叠的 persistent 记录，persistent 审批不反向操作 live；
@@ -874,7 +867,8 @@ RequestId 的传输字段本身独立于参与摘要的普通 header 集合，�
 - RFC 2119, _Key words for use in RFCs to Indicate Requirement Levels_.
 - RFC 8174, _Ambiguity of Uppercase vs Lowercase in RFC 2119 Key Words_.
 - SQLite Documentation, _CREATE TABLE_, _CREATE TRIGGER_, and _UPSERT_.
-- `access/src/migrations/0.sql`，数据库 schema 的权威定义。
+- `src/migrations/0.sql`，基线数据库 schema version 0 的权威定义。
+- `src/migrations/1.sql`，schema version 1 的申请回执表迁移。
 - `access/src/policy.rs`，规则表示与匹配算法的权威实现。
 - `access/src/service.rs`，加载、授权与持久审批流程的权威实现。
 - `access/src/api.rs` 及 `access/src/api/`，HTTP 管理协议的权威实现。

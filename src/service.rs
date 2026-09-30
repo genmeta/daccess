@@ -22,8 +22,11 @@ pub struct AccessService {
 }
 
 impl AccessService {
-    const MIGRATIONS: [&'static str; 1] = [include_str!("migrations/0.sql")];
-    const VERSION: u32 = 0;
+    const MIGRATIONS: [&'static str; 2] = [
+        include_str!("migrations/0.sql"),
+        include_str!("migrations/1.sql"),
+    ];
+    const VERSION: u32 = 1;
 
     pub fn new(db: DatabaseConnection, owner_name: impl Into<String>) -> Self {
         Self {
@@ -40,7 +43,6 @@ impl AccessService {
         name: &str,
         subject_id: &SubjectId,
     ) -> Result<Self, DbErr> {
-        debug_assert_eq!(Self::MIGRATIONS.len(), Self::VERSION as usize + 1);
         let db = Database::connect(dbname).await?;
         Self::migrate(&db).await?;
         Self::load(db, name, subject_id).await
@@ -59,7 +61,6 @@ impl AccessService {
             let transaction = db.begin().await?;
             transaction.execute_unprepared(Self::MIGRATIONS[0]).await?;
             transaction.commit().await?;
-            return Ok(());
         }
 
         let module = db
@@ -70,27 +71,18 @@ impl AccessService {
             .await?
             .ok_or_else(|| DbErr::Type(String::from("module table is empty")))?;
         let version = i64::try_get(&module, "", "version")?;
-        if version < 0 || version > i64::from(Self::VERSION) {
-            return Err(DbErr::Type(format!(
-                "unsupported access database version {version}"
-            )));
-        }
-
-        for version in (version as usize + 1)..=Self::VERSION as usize {
+        if version == 0 {
             let transaction = db.begin().await?;
+            transaction.execute_unprepared(Self::MIGRATIONS[1]).await?;
             transaction
-                .execute_unprepared(Self::MIGRATIONS[version])
-                .await?;
-            transaction
-                .execute_raw(Statement::from_sql_and_values(
-                    DatabaseBackend::Sqlite,
-                    "UPDATE module SET version = ?",
-                    [i32::try_from(version)
-                        .expect("migration version must fit in i32")
-                        .into()],
-                ))
+                .execute_unprepared("UPDATE module SET version = 1 WHERE module_name = 'access'")
                 .await?;
             transaction.commit().await?;
+        } else if version != i64::from(Self::VERSION) {
+            return Err(DbErr::Type(format!(
+                "unsupported access database version {version}; expected schema version {}",
+                Self::VERSION,
+            )));
         }
         Ok(())
     }
@@ -557,6 +549,18 @@ mod tests {
                     r#"INSERT INTO contacts
                        (name, subject_id, status, expired_after, updated_at, created_at)
                        VALUES
+                       ('legacy-status.example', X'04', 1, 1767484800, 1767225600, 1767225600)"#,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .db
+                .execute_unprepared(
+                    r#"INSERT INTO contacts
+                       (name, subject_id, status, expired_after, updated_at, created_at)
+                       VALUES
                        ('blocked.example', X'05', 5, 1767484800, 1767225600, 1767225600)"#,
                 )
                 .await
@@ -693,7 +697,20 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(i64::try_get(&module, "", "version").unwrap(), 0);
+        assert_eq!(i64::try_get(&module, "", "version").unwrap(), 1);
+        let columns = service
+            .db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                String::from("PRAGMA table_info(access_reviews)"),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            columns
+                .iter()
+                .any(|row| String::try_get(row, "", "name").unwrap() == "request_id")
+        );
         assert_eq!(
             service
                 .contacts
@@ -737,6 +754,19 @@ mod tests {
                 .unwrap(),
             AuthResult::Reviewing(..)
         ));
+    }
+
+    #[tokio::test]
+    async fn migration_rejects_unsupported_schema_versions() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared(AccessService::MIGRATIONS[0])
+            .await
+            .unwrap();
+        db.execute_unprepared("UPDATE module SET version = 2")
+            .await
+            .unwrap();
+
+        assert!(AccessService::migrate(&db).await.is_err());
     }
 
     #[tokio::test]
