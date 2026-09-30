@@ -117,6 +117,21 @@ impl AccessService {
             contacts.insert(name, subject_id);
         }
 
+        let policies = Self::policies_from_db(&db, owner_name).await?;
+
+        Ok(Self {
+            db,
+            owner_name: owner_name.to_owned(),
+            contacts: RwLock::new(contacts),
+            policies: RwLock::new(policies),
+            reviews: Default::default(),
+        })
+    }
+
+    pub(crate) async fn policies_from_db(
+        db: &impl ConnectionTrait,
+        owner_name: &str,
+    ) -> Result<Policies, DbErr> {
         let rows = db
             .query_all_raw(Statement::from_string(
                 DatabaseBackend::Sqlite,
@@ -153,13 +168,7 @@ impl AccessService {
             policies.insert(method, &api, effect, grantee);
         }
 
-        Ok(Self {
-            db,
-            owner_name: owner_name.to_owned(),
-            contacts: RwLock::new(contacts),
-            policies: RwLock::new(policies),
-            reviews: Default::default(),
-        })
+        Ok(policies)
     }
 
     pub async fn auth(
@@ -847,6 +856,46 @@ mod tests {
                 .0,
             Effect::Deny
         );
+    }
+
+    #[tokio::test]
+    async fn removing_last_explicit_scope_rule_restores_parent_defaults() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared(AccessService::MIGRATIONS[0])
+            .await
+            .unwrap();
+        db.execute_unprepared(
+            r#"INSERT INTO access_rules
+               (method, api, effect, grantee_type, grantee, updated_at, created_at)
+               VALUES ('*', '/acl', 'allow', 0, 'me.example', 1, 1)"#,
+        )
+        .await
+        .unwrap();
+        let subject_id = SubjectId::new([1]).unwrap();
+        let service = AccessService::load(db, "me.example", &subject_id)
+            .await
+            .unwrap();
+
+        service
+            .remove_policy(
+                Method::Unspecified,
+                "/acl",
+                Grantee::One(String::from("me.example")),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::GET, "/acl/apis", None),
+                    Some("me.example"),
+                    Some(&subject_id),
+                )
+                .await
+                .unwrap(),
+            AuthResult::Allowed
+        ));
     }
 
     #[tokio::test]
