@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const MAX_SUBJECT_ID_LEN: usize = 64;
 
@@ -47,13 +47,12 @@ impl Visitor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SubjectIdError;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(i32)]
 #[serde(rename_all = "snake_case")]
 pub enum ContactStatus {
     #[default]
     Pending = 0,
-    Syncing = 1,
     Active = 2,
     Transfered = 3,
     Expired = 4,
@@ -66,7 +65,6 @@ impl TryFrom<i32> for ContactStatus {
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Pending),
-            1 => Ok(Self::Syncing),
             2 => Ok(Self::Active),
             3 => Ok(Self::Transfered),
             4 => Ok(Self::Expired),
@@ -133,7 +131,6 @@ mod tests {
     #[test]
     fn contact_status_values_match_the_database_contract() {
         assert_eq!(ContactStatus::Pending as i32, 0);
-        assert_eq!(ContactStatus::Syncing as i32, 1);
         assert_eq!(ContactStatus::Active as i32, 2);
         assert_eq!(ContactStatus::Transfered as i32, 3);
         assert_eq!(ContactStatus::Expired as i32, 4);

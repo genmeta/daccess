@@ -6,9 +6,8 @@ mod review;
 mod service;
 
 pub use api::{
-    ContactNotifier, ContactPatch, ContactRecord, GrantedAccess, GrantedMethods, NewContact,
-    NotifyError, RequestedAccess, ReviewRecord, ReviewTarget, router as management_router,
-    router_with_notifier as management_router_with_notifier,
+    ContactPatch, ContactRecord, GrantedAccess, GrantedMethods, NewContact, RequestedAccess,
+    ReviewRecord, ReviewTarget, is_contact_status_path, router as management_router,
 };
 pub use contact::{Contact, ContactStatus, SubjectId, SubjectIdError, Visitor};
 pub use policy::{Effect, Grantee, Method, Policies, PolicyError};

@@ -2,7 +2,7 @@ pub mod access;
 pub mod contact;
 pub mod review;
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::sync::Arc;
 
 use axum::{Router, routing::get};
 pub use contact::{
@@ -12,37 +12,16 @@ pub use review::{ReviewRecord, ReviewTarget};
 
 use crate::AccessService;
 
-pub type NotifyError = Box<dyn std::error::Error + Send + Sync>;
-
-pub trait ContactNotifier: Send + Sync {
-    fn granted_update<'a>(
-        &'a self,
-        contact: &'a str,
-        modified_since: i64,
-        body: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>>;
-}
-
 #[derive(Clone)]
 pub(crate) struct ApiState {
     pub(crate) service: Arc<AccessService>,
-    pub(crate) notifier: Option<Arc<dyn ContactNotifier>>,
 }
 
 pub fn router(service: Arc<AccessService>) -> Router {
-    router_with_notifier(service, None)
-}
-
-pub fn router_with_notifier(
-    service: Arc<AccessService>,
-    notifier: Option<Arc<dyn ContactNotifier>>,
-) -> Router {
     Router::new()
         .route("/contacts", get(contact::list).delete(contact::delete_many))
-        .route(
-            "/contact",
-            axum::routing::post(contact::create).patch(contact::apply_granted_update),
-        )
+        .route("/contact", axum::routing::post(contact::create))
+        .route("/contact/self", get(contact::self_status))
         .route(
             "/contact/{name}",
             get(contact::get)
@@ -65,7 +44,13 @@ pub fn router_with_notifier(
         .route("/acl/review", axum::routing::patch(review::decide))
         .route("/acl/reviews/live", get(review::list_live))
         .route("/acl/reviews/persistent", get(review::list_persistent))
-        .with_state(ApiState { service, notifier })
+        .with_state(ApiState { service })
+}
+
+/// The caller-owned contact status endpoint is authorized by its verified
+/// visitor identity in the handler, rather than ordinary application rules.
+pub fn is_contact_status_path(method: &http::Method, path: &str) -> bool {
+    method == http::Method::GET && path == "/contact/self"
 }
 
 pub(crate) type ApiError = (http::StatusCode, String);
@@ -98,6 +83,7 @@ pub(crate) fn database(error: sea_orm::DbErr) -> ApiError {
 #[cfg(test)]
 mod tests {
     use http_body_util::BodyExt;
+    use radix_trie::TrieCommon;
     use sea_orm::{ConnectionTrait, Database};
     use tower::ServiceExt;
 
@@ -109,21 +95,31 @@ mod tests {
         db.execute_unprepared(include_str!("migrations/0.sql"))
             .await
             .unwrap();
-        let app = router(Arc::new(AccessService::new(db, "owner.example")));
+        db.execute_unprepared(include_str!("migrations/1.sql"))
+            .await
+            .unwrap();
+        let service = Arc::new(AccessService::new(db, "owner.example"));
+        service.contacts.write().await.insert(
+            String::from("owner.example"),
+            crate::SubjectId::new(b"owner-subject".to_vec()).unwrap(),
+        );
+        let app = router(service);
         let mut create = http::Request::builder()
             .method(http::Method::POST)
             .uri("/contact")
             .header(http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(r#"{"name":"alice.example","subject_id":"01","description":"Alice","requested_access":{},"offers":{},"created_at":1893455900,"updated_at":1893456000,"expired_after":1893715200}"#))
+            .body(axum::body::Body::from(r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Alice","requested_access":{},"offers":{}}"#))
             .unwrap();
         create.extensions_mut().insert(crate::Visitor::new(
             "alice.example",
             crate::SubjectId::new(b"01".to_vec()).unwrap(),
         ));
-        assert_eq!(
-            app.clone().oneshot(create).await.unwrap().status(),
-            http::StatusCode::CREATED
-        );
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), http::StatusCode::CREATED);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&created.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(receipt["status"], "active");
 
         let response = app
             .clone()

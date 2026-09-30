@@ -48,7 +48,7 @@ CREATE TABLE contacts (
     requests     TEXT NOT NULL DEFAULT '{}'
         CHECK (json_valid(requests) AND json_type(requests) = 'object'),
     description  TEXT NOT NULL DEFAULT '' CHECK (length(description) <= 80),
-    status       INTEGER NOT NULL CHECK (status IN (0, 1, 2, 3, 4, 5)),
+    status       INTEGER NOT NULL CHECK (status IN (0, 2, 3, 4, 5)),
     expired_after INTEGER NOT NULL CHECK (typeof(expired_after) = 'integer'),
     updated_at    INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer'),
     created_at    INTEGER NOT NULL CHECK (typeof(created_at) = 'integer'),
@@ -76,7 +76,7 @@ CREATE INDEX access_rules_grantee ON access_rules (grantee);
 
 CREATE TABLE access_reviews (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_id   TEXT NOT NULL CHECK (length(request_id) > 0),
+    request_id    TEXT NOT NULL CHECK (length(request_id) > 0),
     visitor      TEXT NOT NULL CHECK (length(visitor) > 0),
     visitor_sid  BLOB NOT NULL CHECK (length(visitor_sid) BETWEEN 1 AND 64),
     method       TEXT NOT NULL CHECK (length(method) > 0 AND method = upper(method)),
