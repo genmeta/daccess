@@ -160,3 +160,19 @@ acl.set_policy(
 cargo test
 cargo check
 ```
+
+## pishoo 集成
+
+`daccess` 是独立的 Rust 库，以 `access_control` crate 提供 `AccessService` 和管理
+Router。pishoo 作为集成方，显式锁定依赖版本或 Git revision。
+
+pishoo 负责 profile 生命周期，为每个 profile 创建独立的 `AccessService` 和 SQLite
+数据库，在 DHTTP/mTLS 验证完成后构造 `Visitor`，并在同一个 Axum 进程中组合管理
+Router、业务 Router 和访问控制中间件。
+
+pishoo 在自身仓库维护 Workspace 前端，提供审批、联系人和访问规则页面，通过
+同进程的 daccess Router 调用 `/acl/*`、`/contacts` 和 `/contact/*`。
+`/workspace-api/context` 由 pishoo 提供当前 profile 的运行时上下文。
+
+Workspace 的前端开发、静态资源构建和浏览器 E2E 均在 pishoo 仓库进行；
+daccess 负责 Rust 库、协议文档、测试和数据库迁移。
