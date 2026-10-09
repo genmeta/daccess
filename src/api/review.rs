@@ -260,14 +260,14 @@ mod tests {
         service.db.execute_unprepared("INSERT INTO access_reviews (request_id, visitor, visitor_sid, method, api, stage, reason, expired_after, updated_at, created_at) VALUES ('r1', 'alice.example', X'01', 'GET', '/api', 1, 'review', 4070995200, 4070908800, 4070908800)").await.unwrap();
         let app = crate::api::router(service.clone());
         let request = http::Request::builder()
-            .uri("/acl/review/1/status")
+            .uri("/std/acl/review/1/status")
             .body(axum::body::Body::empty())
             .unwrap();
         let denied = app.clone().oneshot(request).await.unwrap();
         assert_eq!(denied.status(), http::StatusCode::FORBIDDEN);
 
         let mut request = http::Request::builder()
-            .uri("/acl/review/1/status")
+            .uri("/std/acl/review/1/status")
             .body(axum::body::Body::empty())
             .unwrap();
         request

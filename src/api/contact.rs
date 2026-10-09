@@ -500,11 +500,11 @@ impl AccessService {
                                 &transaction,
                                 name,
                                 &method,
-                                "/contact",
+                                "/std/contact",
                                 Effect::Deny,
                             )
                             .await?;
-                            added_rules.push((method, String::from("/contact"), Effect::Deny));
+                            added_rules.push((method, String::from("/std/contact"), Effect::Deny));
                         }
                         transaction
                             .execute_raw(Statement::from_sql_and_values(
@@ -1343,7 +1343,7 @@ mod tests {
         service.create_contact(item).await.unwrap();
         let app = crate::api::router(service.clone());
 
-        for path in ["/contact/alice.example", "/contacts"] {
+        for path in ["/std/contact/alice.example", "/std/contacts"] {
             let response = app
                 .clone()
                 .oneshot(request(http::Method::GET, path, ""))
@@ -1352,7 +1352,7 @@ mod tests {
             assert_eq!(response.status(), http::StatusCode::OK);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let item = if path == "/contacts" {
+            let item = if path == "/std/contacts" {
                 &json["items"][0]
             } else {
                 &json
@@ -1403,7 +1403,7 @@ mod tests {
                 .await
                 .evaluate(
                     &http::Method::PATCH,
-                    "/contact",
+                    "/std/contact",
                     &[Grantee::One("alice.example".into())]
                 )
                 .0,
@@ -1431,7 +1431,7 @@ mod tests {
                 .await
                 .evaluate(
                     &http::Method::PATCH,
-                    "/contact",
+                    "/std/contact",
                     &[Grantee::One("alice.example".into())]
                 )
                 .0,
@@ -1578,7 +1578,7 @@ mod tests {
         let local = as_visitor(
             request(
                 http::Method::PATCH,
-                "/contact/alice.example",
+                "/std/contact/alice.example",
                 r#"{"status":"active"}"#,
             ),
             "owner.example",
@@ -1642,13 +1642,13 @@ mod tests {
             .unwrap();
         let app = crate::api::router(service);
 
-        let anonymous = request(http::Method::GET, "/contact/self", "");
+        let anonymous = request(http::Method::GET, "/std/contact/self", "");
         assert_eq!(
             app.clone().oneshot(anonymous).await.unwrap().status(),
             http::StatusCode::BAD_REQUEST
         );
 
-        let mut self_request = request(http::Method::GET, "/contact/self", "");
+        let mut self_request = request(http::Method::GET, "/std/contact/self", "");
         self_request.extensions_mut().insert(crate::Visitor::new(
             "alice.example",
             SubjectId::new(vec![1]).unwrap(),
@@ -1665,7 +1665,7 @@ mod tests {
         );
 
         let mismatch = as_visitor(
-            request(http::Method::GET, "/contact/self", ""),
+            request(http::Method::GET, "/std/contact/self", ""),
             "alice.example",
         );
         assert_eq!(
@@ -1674,7 +1674,7 @@ mod tests {
         );
 
         let missing = as_visitor(
-            request(http::Method::GET, "/contact/self", ""),
+            request(http::Method::GET, "/std/contact/self", ""),
             "mallory.example",
         );
         assert_eq!(
@@ -1697,7 +1697,7 @@ mod tests {
                 .await
                 .unwrap();
             let app = crate::api::router(Arc::new(service));
-            let mut request = request(http::Method::GET, "/contact/self", "");
+            let mut request = request(http::Method::GET, "/std/contact/self", "");
             request.extensions_mut().insert(crate::Visitor::new(
                 "alice.example",
                 SubjectId::new(vec![1]).unwrap(),
@@ -1792,7 +1792,7 @@ mod tests {
             .await
             .unwrap();
         let app = crate::api::router(Arc::new(service));
-        let mut request = request(http::Method::GET, "/contact/self", "");
+        let mut request = request(http::Method::GET, "/std/contact/self", "");
         request.extensions_mut().insert(crate::Visitor::new(
             "alice.example",
             SubjectId::new(vec![1]).unwrap(),
@@ -1886,7 +1886,7 @@ mod tests {
         let owner = as_visitor(
             request(
                 http::Method::POST,
-                "/contact",
+                "/std/contact",
                 r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Owner"}"#,
             ),
             "owner.example",
@@ -1898,7 +1898,7 @@ mod tests {
         let create = as_visitor(
             request(
                 http::Method::POST,
-                "/contact",
+                "/std/contact",
                 r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","class":"agent","description":"Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
             ),
             "alice.example",
@@ -1910,7 +1910,7 @@ mod tests {
         let retry = as_visitor(
             request(
                 http::Method::POST,
-                "/contact",
+                "/std/contact",
                 r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","class":"agent","description":"Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
             ),
             "alice.example",
@@ -1922,7 +1922,7 @@ mod tests {
         let status = as_visitor(
             request(
                 http::Method::GET,
-                "/contact/self?application_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "/std/contact/self?application_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "",
             ),
             "alice.example",
@@ -1937,7 +1937,7 @@ mod tests {
         let duplicate = as_visitor(
             request(
                 http::Method::POST,
-                "/contact",
+                "/std/contact",
                 r#"{"application_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","class":"service","description":"Updated Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
             ),
             "alice.example",
@@ -1947,7 +1947,7 @@ mod tests {
             http::StatusCode::CONFLICT
         );
 
-        let get = request(http::Method::GET, "/contact/alice.example", "");
+        let get = request(http::Method::GET, "/std/contact/alice.example", "");
         let response = app.clone().oneshot(get).await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -1962,7 +1962,7 @@ mod tests {
             7 * 86_400
         );
 
-        let list = request(http::Method::GET, "/contacts", "");
+        let list = request(http::Method::GET, "/std/contacts", "");
         assert_eq!(
             app.clone().oneshot(list).await.unwrap().status(),
             http::StatusCode::OK
@@ -1970,7 +1970,7 @@ mod tests {
 
         let delete = request(
             http::Method::DELETE,
-            "/contacts",
+            "/std/contacts",
             r#"{"names":["alice.example"]}"#,
         );
         assert_eq!(
@@ -1978,7 +1978,7 @@ mod tests {
             http::StatusCode::NO_CONTENT
         );
         assert!(service.find_contact_by_name("alice.example").await.is_err());
-        let missing = request(http::Method::GET, "/contact/alice.example", "");
+        let missing = request(http::Method::GET, "/std/contact/alice.example", "");
         assert_eq!(
             app.oneshot(missing).await.unwrap().status(),
             http::StatusCode::NOT_FOUND
@@ -2014,7 +2014,7 @@ mod tests {
                 .clone()
                 .oneshot(request(
                     http::Method::GET,
-                    &format!("/contacts?page=1&page_size=1&sort={sort}&order=asc"),
+                    &format!("/std/contacts?page=1&page_size=1&sort={sort}&order=asc"),
                     "",
                 ))
                 .await
@@ -2033,7 +2033,7 @@ mod tests {
             .clone()
             .oneshot(request(
                 http::Method::GET,
-                "/contacts?page=2&page_size=1&sort=name&order=asc",
+                "/std/contacts?page=2&page_size=1&sort=name&order=asc",
                 "",
             ))
             .await
@@ -2044,9 +2044,9 @@ mod tests {
         assert_eq!(body["items"][0]["name"], "bob.example");
 
         for (uri, expected) in [
-            ("/contacts?page_size=1", "charlie.example"),
+            ("/std/contacts?page_size=1", "charlie.example"),
             (
-                "/contacts?page_size=1&sort=name&order=desc",
+                "/std/contacts?page_size=1&sort=name&order=desc",
                 "charlie.example",
             ),
         ] {
@@ -2062,10 +2062,10 @@ mod tests {
         }
 
         for uri in [
-            "/contacts?page=0",
-            "/contacts?page_size=101",
-            "/contacts?sort=unknown",
-            "/contacts?order=sideways",
+            "/std/contacts?page=0",
+            "/std/contacts?page_size=101",
+            "/std/contacts?sort=unknown",
+            "/std/contacts?order=sideways",
         ] {
             assert_eq!(
                 app.clone()
@@ -2094,7 +2094,7 @@ mod tests {
         let app = crate::api::router(service.clone());
         let approval = request(
             http::Method::PATCH,
-            "/contact/alice.example",
+            "/std/contact/alice.example",
             r#"{"status":"active"}"#,
         );
         assert_eq!(
@@ -2119,7 +2119,7 @@ mod tests {
 
         let anonymous = request(
             http::Method::PATCH,
-            "/contact/alice.example",
+            "/std/contact/alice.example",
             r#"{"status":"active"}"#,
         );
         assert_eq!(
@@ -2131,7 +2131,7 @@ mod tests {
             (r#"{}"#, http::StatusCode::BAD_REQUEST),
             (r#"{"status":"active"}"#, http::StatusCode::NO_CONTENT),
         ] {
-            let approval = request(http::Method::PATCH, "/contact/alice.example", body);
+            let approval = request(http::Method::PATCH, "/std/contact/alice.example", body);
             assert_eq!(
                 app.clone()
                     .oneshot(as_visitor(approval, "admin.example"))
@@ -2167,7 +2167,7 @@ mod tests {
 
         let block = request(
             http::Method::PATCH,
-            "/contact/alice.example",
+            "/std/contact/alice.example",
             r#"{"status":"blocked","alias":"Alice"}"#,
         );
         assert_eq!(
@@ -2201,7 +2201,7 @@ mod tests {
 
         let unblock = request(
             http::Method::PATCH,
-            "/contact/alice.example",
+            "/std/contact/alice.example",
             r#"{"status":"active"}"#,
         );
         assert_eq!(
@@ -2231,7 +2231,7 @@ mod tests {
 
         let clear_alias = request(
             http::Method::PATCH,
-            "/contact/alice.example",
+            "/std/contact/alice.example",
             r#"{"alias":""}"#,
         );
         assert_eq!(
@@ -2259,7 +2259,7 @@ mod tests {
         let app = crate::api::router(service.clone());
         let block = request(
             http::Method::PATCH,
-            "/contact/alice.example",
+            "/std/contact/alice.example",
             r#"{"status":"blocked"}"#,
         );
 
@@ -2295,7 +2295,7 @@ mod tests {
         service
             .set_policy(
                 method.clone(),
-                "/acl/review",
+                "/std/acl/review",
                 Effect::Allow,
                 Grantee::One("alice.example".into()),
             )
@@ -2304,7 +2304,7 @@ mod tests {
         service
             .set_policy(
                 method.clone(),
-                "/acl/review",
+                "/std/acl/review",
                 Effect::Deny,
                 Grantee::One("owner.example".into()),
             )
@@ -2313,7 +2313,7 @@ mod tests {
         let app = crate::api::router(service.clone());
         let block = request(
             http::Method::PATCH,
-            "/contact/alice.example",
+            "/std/contact/alice.example",
             r#"{"status":"blocked"}"#,
         );
 
@@ -2334,7 +2334,7 @@ mod tests {
                 .await
                 .evaluate(
                     &http::Method::PATCH,
-                    "/acl/review",
+                    "/std/acl/review",
                     &[Grantee::One("alice.example".into())]
                 )
                 .0,
@@ -2355,7 +2355,7 @@ mod tests {
         let approval = as_visitor(
             request(
                 http::Method::PATCH,
-                "/contact/alice.example",
+                "/std/contact/alice.example",
                 r#"{"status":"active"}"#,
             ),
             "owner.example",

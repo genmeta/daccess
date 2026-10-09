@@ -106,7 +106,7 @@ match acl
 
 ### 4. 挂载管理 API
 
-管理 Router 应和业务 Router 合并后，再整体套上访问控制中间件。这样 `/contact` 和 `/acl` 自身也会受到同一个 `AccessService` 的规则约束：
+管理 Router 应和业务 Router 合并后，再整体套上访问控制中间件。这样 `/std/contact` 和 `/std/acl` 自身也会受到同一个 `AccessService` 的规则约束：
 
 ```rust
 use access_control::management_router;
@@ -119,9 +119,9 @@ let application = application.layer(your_access_control_middleware(acl.clone()))
 
 主要端点包括：
 
-- `/contact`、`/contact/self`、`/contact/{name}`、`/contacts`：联系人申请、申请方状态查询和管理；
-- `/acl/apis`、`/acl/access`、`/acl/allow`：权限规则管理；
-- `/acl/review`、`/acl/reviews`：审批管理；`/acl/review/{id}/status`：发起方状态查询。
+- `/std/contact`、`/std/contact/self`、`/std/contact/{name}`、`/std/contacts`：联系人申请、申请方状态查询和管理；
+- `/std/acl/apis`、`/std/acl/access`、`/std/acl/allow`：权限规则管理；
+- `/std/acl/review`、`/std/acl/reviews`：审批管理；`/std/acl/review/{id}/status`：发起方状态查询。
 
 具体 method、请求体和响应体见 [SPEC.md 的 HTTP API 章节](SPEC.md#10-http-api)。
 
@@ -130,7 +130,7 @@ let application = application.layer(your_access_control_middleware(acl.clone()))
 本地管理员批准联系人只写入本 profile 的状态并立即返回；pishoo 不会向对端建立
 连接、维护重试或判断对方是否在线。发送方 pishoo 将申请保存到本地队列并重试投递；
 接收方以实际收到时间设定 7 天有效期。申请方以后通过已认证的 DHTTP 请求调用
-`GET /contact/self?application_id=...` 拉取该申请状态和当前精确授权。
+`GET /std/contact/self?application_id=...` 拉取该申请状态和当前精确授权。
 
 该端点不接受联系人名称参数。承载应用必须先从 mTLS/DHTTP 连接构造 `Visitor`，
 再允许端点绕过常规业务 ACL；handler 会用该 Visitor 的 name 和 SubjectId 校验
@@ -171,7 +171,7 @@ pishoo 负责 profile 生命周期，为每个 profile 创建独立的 `AccessSe
 Router、业务 Router 和访问控制中间件。
 
 pishoo 在自身仓库维护 Workspace 前端，提供审批、联系人和访问规则页面，通过
-同进程的 daccess Router 调用 `/acl/*`、`/contacts` 和 `/contact/*`。
+同进程的 daccess Router 调用 `/std/acl/*`、`/std/contacts` 和 `/std/contact/*`。
 `/workspace-api/context` 由 pishoo 提供当前 profile 的运行时上下文。
 
 Workspace 的前端开发、静态资源构建和浏览器 E2E 均在 pishoo 仓库进行；

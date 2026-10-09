@@ -18,6 +18,15 @@
 
 设计的核心约束是：名称由传输层 mTLS 认证，`SubjectId` 用于确认该名称背后的主体是否发生转让；规则是本地入站授权的唯一事实来源；联系人交换的权限声明只描述双方提出或公开的能力，不能替代本地规则；审批始终持久化，并且原业务请求绝不等待管理员决定。
 
+## 系统路径更新（2026-10-09）
+
+管理 HTTP 入口固定使用 `/std/contact`、`/std/contacts` 与 `/std/acl/*`，
+不提供旧 `/contact`、`/contacts`、`/acl/*` 的兼容路由。
+审批 `status_url`、状态路径识别、联系人拉黑规则及最后一位管理员保护使用相同命名空间。
+授权核心仍接受任意业务路径；普通业务规则不自动添加 `/std`。
+数据库 schema 和 Rust 接口签名不变，已有规则、联系人声明和审批记录不自动迁移。
+承载应用须核对旧系统规则并明确设置新路径，不能批量重写上游业务路径。
+
 ## 1. 规范性语言
 
 本文中的“必须（MUST）”、“不得（MUST NOT）”、“应当（SHOULD）”、“不应（SHOULD NOT）”和“可以（MAY）”按照 RFC 2119 与 RFC 8174 的通常含义解释，但仅在以大写英文关键词同时出现时具有规范性。
@@ -83,7 +92,7 @@
 - `grants`：保留的历史字段；当前拉取协议不写入它；
 - `offers`：联系人申请方可展示的待授予声明，或拉黑时保存的本地规则快照。
 
-本方管理员批准对方请求时，应先在 `access_rules` 中建立最终规则，再将联系人状态更新为 Active。申请方随后通过 `GET /contact/self` 拉取自身状态和当前精确授权。系统 MUST NOT 将管理员审批结果重复存入联系人 `grants` 字段，也不得依赖对端在线或建立出站连接。
+本方管理员批准对方请求时，应先在 `access_rules` 中建立最终规则，再将联系人状态更新为 Active。申请方随后通过 `GET /std/contact/self` 拉取自身状态和当前精确授权。系统 MUST NOT 将管理员审批结果重复存入联系人 `grants` 字段，也不得依赖对端在线或建立出站连接。
 
 这种分离消除了两个本地事实来源之间的同步竞争，并允许 `deny`、组规则、匿名规则等并不属于联系人声明的规则正常存在。
 
@@ -154,7 +163,7 @@ API 必须是以 `/` 开头的绝对路径。除根路径 `/` 外，持久化路
 
 联系人 HTTP 请求中的 `subject_id` 是长度 1 至 64 字节的字符串；服务按该字符串的 UTF-8 字节存入 BLOB。当前接口不执行十六进制解码。DHTTP owner hash 应直接作为 64 字符字符串传递。
 
-本地管理查询 `GET /contact/{name}` 与 `GET /contacts` 中的 `subject_id` 用于展示。
+本地管理查询 `GET /std/contact/{name}` 与 `GET /std/contacts` 中的 `subject_id` 用于展示。
 可读 UTF-8 文本按原文返回，包括 DHTTP 的 64 字符 owner hash；非 UTF-8 字节或包含控制字符的值，
 返回 `hex:` 前缀加原始字节的小写十六进制，例如字节 `00 80 ff 41` 返回 `hex:0080ff41`。
 管理查询不得使用有损 UTF-8 解码生成替换字符。该展示形式不用于身份认证、主体比较或联系人交换，
@@ -347,7 +356,7 @@ license     = Apache-2.0
 ```json
 {
   "review_id": 12,
-  "status_url": "/acl/review/12/status"
+  "status_url": "/std/acl/review/12/status"
 }
 ```
 
@@ -396,21 +405,21 @@ license     = Apache-2.0
 
 联系人申请不产生任何回调或业务访问规则。申请方提供的 `offers` 仅是声明，不会在发送 POST 时写入 `access_rules`。申请方获批后，应由其自身在合适时机重新查询对方；对方也不负责确认申请方是否在线。
 
-同名记录仍处于 Pending 时，新编号的 POST 返回 409；相同编号和载荷的重试返回原状态。Expired 允许新编号重新申请，Blocked 返回 409。处于 Active 或 Transfered 时，新的申请可更新资料并保持联系人状态。删除联系人会删除整条联系人及其精确规则，但保留申请审计记录。联系人只能从 Active 或 Transfered 变为 Blocked；Pending 和 Expired 都不得被拉黑。拉黑事务 MUST 将该联系人当前的全部精确权限规则保存到 `offers`，删除这些生效规则，再为该联系人明确写入 `POST /contact` 的 deny 规则。
+同名记录仍处于 Pending 时，新编号的 POST 返回 409；相同编号和载荷的重试返回原状态。Expired 允许新编号重新申请，Blocked 返回 409。处于 Active 或 Transfered 时，新的申请可更新资料并保持联系人状态。删除联系人会删除整条联系人及其精确规则，但保留申请审计记录。联系人只能从 Active 或 Transfered 变为 Blocked；Pending 和 Expired 都不得被拉黑。拉黑事务 MUST 将该联系人当前的全部精确权限规则保存到 `offers`，删除这些生效规则，再为该联系人明确写入 `POST /std/contact` 的 deny 规则。
 
 ### 9.4 本地批准
 
-具有 `PATCH /contact/{name}` allow 权限的本地管理员批准时，系统必须验证联系人为未过期的 Pending 或 Transfered，随后在本地事务中直接将状态更新为 Active。该操作不访问网络、不等待对端、也不更新 `grants` 或 `offers`。对方上线后自行发起第 9.5 节的状态查询。
+具有 `PATCH /std/contact/{name}` allow 权限的本地管理员批准时，系统必须验证联系人为未过期的 Pending 或 Transfered，随后在本地事务中直接将状态更新为 Active。该操作不访问网络、不等待对端、也不更新 `grants` 或 `offers`。对方上线后自行发起第 9.5 节的状态查询。
 
 ### 9.5 申请方状态查询
 
-申请方使用已认证的 DHTTP/mTLS 身份发起 `GET /contact/self?application_id={id}`。端点按编号查找持久申请记录，并验证申请人名称和 SubjectId 与 Visitor 完全一致；不接受调用者提交的身份字段。无编号的查询仍返回当前联系人状态。
+申请方使用已认证的 DHTTP/mTLS 身份发起 `GET /std/contact/self?application_id={id}`。端点按编号查找持久申请记录，并验证申请人名称和 SubjectId 与 Visitor 完全一致；不接受调用者提交的身份字段。无编号的查询仍返回当前联系人状态。
 
 响应只包含联系人 `status` 和 `granted_access`。状态不是 Active 时 `granted_access` 必须为空；Active 时它从本方当前 `access_rules` 中收集该精确名称的 allow、review 和 deny 规则。因此返回值始终反映本方本地授权，不承诺申请方在离线期间已经处理该结果。
 
 ### 9.6 拉黑与恢复
 
-本地管理员只可将 Active 或 Transfered 联系人改为 Blocked。该操作 MUST 在同一事务中完成以下步骤：将联系人现有的全部精确规则按 `GrantedAccess` 结构写入 `offers`；删除这些规则；写入该联系人对 `POST /contact` 的 deny 规则；将状态改为 Blocked。若删除原规则会使任一 `/acl` 管理 API 不再具有至少一位 allow 管理员，整个事务必须失败。
+本地管理员只可将 Active 或 Transfered 联系人改为 Blocked。该操作 MUST 在同一事务中完成以下步骤：将联系人现有的全部精确规则按 `GrantedAccess` 结构写入 `offers`；删除这些规则；写入该联系人对 `POST /std/contact` 的 deny 规则；将状态改为 Blocked。若删除原规则会使任一 `/std/acl` 管理 API 不再具有至少一位 allow 管理员，整个事务必须失败。
 
 取消拉黑只允许 `Blocked -> Active`。实现 MUST 删除拉黑 deny 规则，从 `offers` 恢复原 allow、review 和 deny 规则，清空 `offers`，再将状态改为 Active。数据库提交后必须以同样顺序更新内存策略树。
 
@@ -437,7 +446,7 @@ license     = Apache-2.0
 
 ### 10.2 联系人 API
 
-#### `POST /contact`
+#### `POST /std/contact`
 
 请求体：
 
@@ -461,7 +470,7 @@ license     = Apache-2.0
 
 `application_id` 是发送方生成并在重试中保持不变的 64 位小写十六进制编号。`class`、`requested_access` 和 `offers` 可省略并默认为空；`offers` 为空是合法的。POST 不会建立回调权限或应用任何 `offers`。`description` 必填，可为空字符串，最多 80 个 Unicode 字符。请求体不接受名称、SubjectId 或时间字段；身份只来自已验证的 mTLS Visitor。首次创建返回 201，幂等重试返回 200，均返回申请编号、接收方名称与 SubjectId、状态、收到时间和到期时间。
 
-#### `GET /contacts`
+#### `GET /std/contacts`
 
 支持 `page`、`page_size`、`sort` 和 `order`。`sort` 可选：
 
@@ -473,7 +482,7 @@ license     = Apache-2.0
 
 默认按 `updated_at desc`。除按名称排序外，同值记录以 `name asc` 稳定排序。
 
-#### `GET /contact/{name}`
+#### `GET /std/contact/{name}`
 
 返回单个联系人：
 
@@ -498,7 +507,7 @@ license     = Apache-2.0
 `blocked`。数据库继续使用第 5.2 节定义的整数表示；整数值不属于 HTTP
 接口契约。
 
-#### `PATCH /contact/{name}`
+#### `PATCH /std/contact/{name}`
 
 该接口是本地管理操作。mTLS 来访者必须已经获得该 API 的 allow 权限；来访者可以是当前 profile owner，也可以是其他管理员。请求体支持局部修改 `status` 和 `alias`，但至少必须提供其中一个字段：
 
@@ -511,7 +520,7 @@ license     = Apache-2.0
 
 `status` 只接受 `active` 或 `blocked`：`active` 表示批准 Pending/Transfered 联系人，或取消拉黑；`blocked` 表示拉黑。空 `alias` 表示清除本地别名。状态转换必须符合第 9.4 和 9.6 节。授权由统一访问控制层在进入联系人处理器前完成；处理器仍要求存在经过 mTLS 认证的 Visitor，但不得再额外限定其名称必须等于 `owner_name`。空对象或未知字段必须被拒绝。
 
-#### `GET /contact/self`
+#### `GET /std/contact/self`
 
 申请方状态查询端点。调用者不传名称；服务从已验证的 mTLS Visitor 取得 name 和
 SubjectId。携带 `application_id` 时按申请编号返回该申请的 pending/active/expired/denied/revoked 状态、接收方身份和时间；无编号时返回当前联系人状态。Active 时包含当前精确授权：
@@ -539,21 +548,21 @@ SubjectId。携带 `application_id` 时按申请编号返回该申请的 pending
 未认证调用返回 400，联系人不存在返回 404，SubjectId 与已保存联系人不匹配返回
 403。该端点在常规业务 ACL 之外由身份绑定保护，不能用作按名称查询联系人。
 
-#### `DELETE /contact/{name}`
+#### `DELETE /std/contact/{name}`
 
-删除单个联系人及其精确主体规则。如果该联系人是某个 `/acl` 管理 API 规则作用域内最后一位具有 allow 权限的管理员，并且 owner 在该作用域没有 allow 权限，则返回 400。普通业务 API 上的规则不触发这项保护。
+删除单个联系人及其精确主体规则。如果该联系人是某个 `/std/acl` 管理 API 规则作用域内最后一位具有 allow 权限的管理员，并且 owner 在该作用域没有 allow 权限，则返回 400。普通业务 API 上的规则不触发这项保护。
 
-#### `DELETE /contacts`
+#### `DELETE /std/contacts`
 
-请求体 `{"names":["alice.example","bob.example"]}`。操作在单一数据库事务中执行；任一联系人不存在，或整个批次会使任一 `/acl` 管理 API 规则作用域不再具有 allow 管理员时，整个批次失败。
+请求体 `{"names":["alice.example","bob.example"]}`。操作在单一数据库事务中执行；任一联系人不存在，或整个批次会使任一 `/std/acl` 管理 API 规则作用域不再具有 allow 管理员时，整个批次失败。
 
 ### 10.3 访问规则管理 API
 
-`/acl/apis` 分页列出 API；`/acl/access` 按 API 组织规则；`/acl/allow` 按 grantee 名称组织规则。
+`/std/acl/apis` 分页列出 API；`/std/acl/access` 按 API 组织规则；`/std/acl/allow` 按 grantee 名称组织规则。
 
-#### `POST /acl/access/{api}`
+#### `POST /std/acl/access/{api}`
 
-对路径指定的 API 创建或覆盖一条规则。例如 `/users` 使用 `POST /acl/access/users`：
+对路径指定的 API 创建或覆盖一条规则。例如 `/users` 使用 `POST /std/acl/access/users`：
 
 ```json
 {
@@ -563,9 +572,9 @@ SubjectId。携带 `application_id` 时按申请编号返回该申请的 pending
 }
 ```
 
-请求体不得再携带 `api`，路径是目标 API 的唯一来源。成功返回 204。除 owner 外，精确 grantee 不存在于联系人表时写入失败。修改 `/acl` 管理 API 的规则时，操作后的同一 method/API 作用域必须仍有至少一个 `Grantee::One` 或 `Grantee::Group` 具有 allow 权限；普通业务 API 不受这项约束。设置 `*?` 会删除同一 method/API 的 `**` 和 `?`；反向设置同理删除 `*?`。
+请求体不得再携带 `api`，路径是目标 API 的唯一来源。成功返回 204。除 owner 外，精确 grantee 不存在于联系人表时写入失败。修改 `/std/acl` 管理 API 的规则时，操作后的同一 method/API 作用域必须仍有至少一个 `Grantee::One` 或 `Grantee::Group` 具有 allow 权限；普通业务 API 不受这项约束。设置 `*?` 会删除同一 method/API 的 `**` 和 `?`；反向设置同理删除 `*?`。
 
-#### `PATCH /acl/allow/{name}`
+#### `PATCH /std/acl/allow/{name}`
 
 ```json
 {
@@ -577,7 +586,7 @@ SubjectId。携带 `application_id` 时按申请编号返回该申请的 pending
 
 路径中的 `{name}` 是规则 grantee。该操作修改或覆盖此 grantee 在请求体指定 API/method 上的 effect，成功返回 204。
 
-#### `DELETE /acl/allow/{name}`
+#### `DELETE /std/acl/allow/{name}`
 
 ```json
 {
@@ -586,9 +595,9 @@ SubjectId。携带 `application_id` 时按申请编号返回该申请的 pending
 }
 ```
 
-effect 不属于规则标识，因此删除请求不携带 effect。不存在的规则按幂等删除处理并返回 204。删除 `/acl` 管理 API 上最后一条 `One` 或 `Group` allow 管理员规则，并且 owner 已不具备 allow 权限时，返回 400。
+effect 不属于规则标识，因此删除请求不携带 effect。不存在的规则按幂等删除处理并返回 204。删除 `/std/acl` 管理 API 上最后一条 `One` 或 `Group` allow 管理员规则，并且 owner 已不具备 allow 权限时，返回 400。
 
-#### `GET /acl/apis`
+#### `GET /std/acl/apis`
 
 分页列出不同 API，而不是一次返回所有规则。查询参数支持 `page`、`page_size`、`sort=api|updated_at` 和 `order`，默认 `updated_at desc`。
 
@@ -601,7 +610,7 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 }
 ```
 
-#### `GET /acl/access`
+#### `GET /std/acl/access`
 
 不分页，以 API、方法、effect 三级结构返回全部显式规则：
 
@@ -617,11 +626,11 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 }
 ```
 
-#### `GET /acl/access/{api}`
+#### `GET /std/acl/access/{api}`
 
 一个 API 通常只有少量方法和 effect，因此该接口不分页：
 
-路径参数承载完整的规范化 API 路径，但省略开头的 `/`。例如 `/users/profile` 对应 `GET /acl/access/users/profile`。
+路径参数承载完整的规范化 API 路径，但省略开头的 `/`。例如 `/users/profile` 对应 `GET /std/acl/access/users/profile`。
 
 ```json
 {
@@ -638,7 +647,7 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 }
 ```
 
-#### `GET /acl/allow/{name}`
+#### `GET /std/acl/allow/{name}`
 
 按 grantee 查询其规则，并按 API 分页。支持 `page`、`page_size`、`sort=api|updated_at` 和 `order`。
 
@@ -661,7 +670,7 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 
 这里分页单位是 API，不是单条规则；`total` 是该 grantee 关联的不同 API 数量。
 
-#### `GET /acl/allow`
+#### `GET /std/acl/allow`
 
 不分页，以 grantee、API、effect 的结构返回全部显式规则，effect 数组中存放方法：
 
@@ -679,7 +688,7 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 
 ### 10.4 审批管理 API
 
-#### `GET /acl/reviews`
+#### `GET /std/acl/reviews`
 
 分页列出未过期 pending 审批，按递增数据库 id 排序：
 
@@ -701,7 +710,7 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 }
 ```
 
-#### `GET /acl/review/{id}/status`
+#### `GET /std/acl/review/{id}/status`
 
 供发起审批的业务调用方轮询。该端点不执行常规业务 ACL 匹配，以免状态查询再次进入审批；它必须从已验证 `Visitor` extension 读取身份，并只返回该名称和 `SubjectId` 创建的记录。身份不匹配或 id 不存在返回 404，缺少已验证身份返回 403。
 
@@ -711,7 +720,7 @@ effect 不属于规则标识，因此删除请求不携带 effect。不存在的
 
 `status` 为 `pending`、`allowed`、`denied` 或 `expired`。它不会消费 allow/deny 决定。
 
-#### `PATCH /acl/review`
+#### `PATCH /std/acl/review`
 
 ```json
 {
@@ -758,17 +767,17 @@ pending 到 allow/deny 的转换使用带 `stage = 0` 和有效期条件的单�
 
 ### 13.1 管理 API 的管理员存续保护
 
-本文所称“管理 API”特指规范化路径等于 `/acl` 或以 `/acl/` 开头的 API，包括规则和审批端点。`/contact`、`/contacts` 与 `/contact/*` 是联系人协议或联系人查询端点，不纳入“始终保留至少一位管理员”的规则作用域；但删除联系人可能连带删除该联系人名下的 `/acl` allow 规则，因此删除操作仍必须执行管理员存续检查。
+本文所称“管理 API”特指规范化路径等于 `/std/acl` 或以 `/std/acl/` 开头的 API，包括规则和审批端点。`/std/contact`、`/std/contacts` 与 `/std/contact/*` 是联系人协议或联系人查询端点，不纳入“始终保留至少一位管理员”的规则作用域；但删除联系人可能连带删除该联系人名下的 `/std/acl` allow 规则，因此删除操作仍必须执行管理员存续检查。
 
 承载应用 MUST 使用本访问控制保护这些端点，不得因为它们属于 ACL 模块就默认公开。
 
 `AccessService` 保存当前 profile 的 owner 名称，用于建立内存策略基线、验证联系人名称和保护管理 API 的管理员存续。该字段不赋予 owner 不可撤销的权限：启动策略会在各规则作用域先加入 owner allow 基线，随后加载的同键显式规则仍可将其改为 review 或 deny，从而允许 owner 本人也受策略管理的托管模式。
 
-每个 `/acl` 管理 API 的 `(method, api)` 规则作用域在修改后 MUST 至少保留一个 effect 为 allow 的 `Grantee::One` 或 `Grantee::Group`。满足该条件的主体就是管理员：默认情况下是 owner；也可以是其他精确命名主体或组。
+每个 `/std/acl` 管理 API 的 `(method, api)` 规则作用域在修改后 MUST 至少保留一个 effect 为 allow 的 `Grantee::One` 或 `Grantee::Group`。满足该条件的主体就是管理员：默认情况下是 owner；也可以是其他精确命名主体或组。
 
-如果 owner 被配置为 review 或 deny，则同一管理作用域必须先有另一位 allow 管理员。任何管理员被改为 review 或 deny、其 allow 规则被删除，或者其联系人记录被删除时，系统都必须验证操作完成后仍有至少一位 allow 管理员；否则拒绝整个操作。`Named`、`Anony` 和 `All` 即使配置为 allow，也不计作管理员。该约束仅作用于 `/acl` 管理 API，不限制普通业务 API 的规则配置。
+如果 owner 被配置为 review 或 deny，则同一管理作用域必须先有另一位 allow 管理员。任何管理员被改为 review 或 deny、其 allow 规则被删除，或者其联系人记录被删除时，系统都必须验证操作完成后仍有至少一位 allow 管理员；否则拒绝整个操作。`Named`、`Anony` 和 `All` 即使配置为 allow，也不计作管理员。该约束仅作用于 `/std/acl` 管理 API，不限制普通业务 API 的规则配置。
 
-Owner 不写入联系人表。管理路由使用 `AccessService` 持有的 profile owner 名称，并把它作为保留名称：`POST /contact` 创建同名联系人时必须返回 400，防止联系人记录覆盖内存 trie 中 owner 的 `SubjectId`。
+Owner 不写入联系人表。管理路由使用 `AccessService` 持有的 profile owner 名称，并把它作为保留名称：`POST /std/contact` 创建同名联系人时必须返回 400，防止联系人记录覆盖内存 trie 中 owner 的 `SubjectId`。
 
 ### 13.2 名称认证与主体连续性
 
@@ -797,7 +806,7 @@ Request ID 是服务端生成的 64 字符小写十六进制 SHA-256 摘要。�
 
 ### 13.5 联系人状态查询隔离
 
-`GET /contact/self` 必须仅以传输层已验证的 Visitor 识别调用者，不得接受请求体、
+`GET /std/contact/self` 必须仅以传输层已验证的 Visitor 识别调用者，不得接受请求体、
 header 或路径中声明的联系人名称。实现必须复核保存的 SubjectId，避免名称转让后
 的新主体读取旧主体的联系人状态或规则。该工作流不建立出站 DHTTP 连接，不需要
 服务端跟踪对端在线状态、重试通知或访问对端私钥。
@@ -834,12 +843,12 @@ header 或路径中声明的联系人名称。实现必须复核保存的 Subjec
 4. 数据库规则与内存策略在创建、更新和删除后保持一致；
 5. 联系人创建不产生访问规则，删除联系人清理精确规则；
 6. 本地批准直接写为 Active，不建立对端通知、重试任务或连接等待；
-7. `/contact/self` 只允许同名且 SubjectId 完全匹配的已验证 visitor 读取自身状态和 Active 时的本地精确授权；
+7. `/std/contact/self` 只允许同名且 SubjectId 完全匹配的已验证 visitor 读取自身状态和 Active 时的本地精确授权；
 8. 冻结状态拒绝重复申请且保持申请时间戳，只有 Active/Transfered 接受资料更新；删除记录后允许重新申请；
 9. review pending 列表正确分页，且只包含未过期记录；
 10. review 立即返回 `202`，不保留连接、Future/Waker 或内存等待者；
 11. review 状态查询只允许创建该 review 的已验证 visitor，且 allow/deny 决定只能被完全匹配的请求消费一次；
-12. `/acl` 管理 API 的规则变更和联系人删除不会移除最后一位 allow 管理员，普通业务 API 不受这项限制。
+12. `/std/acl` 管理 API 的规则变更和联系人删除不会移除最后一位 allow 管理员，普通业务 API 不受这项限制。
 
 ## 16. IANA 考虑
 
