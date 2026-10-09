@@ -19,38 +19,41 @@ pub(crate) struct ApiState {
 
 pub fn router(service: Arc<AccessService>) -> Router {
     Router::new()
-        .route("/contacts", get(contact::list).delete(contact::delete_many))
-        .route("/contact", axum::routing::post(contact::create))
-        .route("/contact/self", get(contact::self_status))
         .route(
-            "/contact/{name}",
+            "/std/contacts",
+            get(contact::list).delete(contact::delete_many),
+        )
+        .route("/std/contact", axum::routing::post(contact::create))
+        .route("/std/contact/self", get(contact::self_status))
+        .route(
+            "/std/contact/{name}",
             get(contact::get)
                 .patch(contact::patch)
                 .delete(contact::delete),
         )
-        .route("/acl/access", get(access::list_all_rules_by_api))
+        .route("/std/acl/access", get(access::list_all_rules_by_api))
         .route(
-            "/acl/access/{*api}",
+            "/std/acl/access/{*api}",
             get(access::list_rules_by_api).post(access::set_by_api),
         )
-        .route("/acl/apis", get(access::list_apis))
-        .route("/acl/allow", get(access::list_all_rules_by_name))
+        .route("/std/acl/apis", get(access::list_apis))
+        .route("/std/acl/allow", get(access::list_all_rules_by_name))
         .route(
-            "/acl/allow/{name}",
+            "/std/acl/allow/{name}",
             get(access::list_rules_by_name)
                 .patch(access::set_by_name)
                 .delete(access::delete_by_name),
         )
-        .route("/acl/review", axum::routing::patch(review::decide))
-        .route("/acl/reviews", get(review::list_persistent))
-        .route("/acl/review/{id}/status", get(review::status))
+        .route("/std/acl/review", axum::routing::patch(review::decide))
+        .route("/std/acl/reviews", get(review::list_persistent))
+        .route("/std/acl/review/{id}/status", get(review::status))
         .with_state(ApiState { service })
 }
 
 /// The caller-owned contact status endpoint is authorized by its verified
 /// visitor identity in the handler, rather than ordinary application rules.
 pub fn is_contact_status_path(method: &http::Method, path: &str) -> bool {
-    method == http::Method::GET && path == "/contact/self"
+    method == http::Method::GET && path == "/std/contact/self"
 }
 
 pub(crate) type ApiError = (http::StatusCode, String);
@@ -104,9 +107,37 @@ mod tests {
             crate::SubjectId::new(b"owner-subject".to_vec()).unwrap(),
         );
         let app = router(service);
+        assert!(is_contact_status_path(
+            &http::Method::GET,
+            "/std/contact/self"
+        ));
+        assert!(!is_contact_status_path(&http::Method::GET, "/contact/self"));
+        for path in [
+            "/contact",
+            "/contact/self",
+            "/contacts",
+            "/acl/access",
+            "/acl/reviews",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        http::Request::builder()
+                            .uri(path)
+                            .body(axum::body::Body::empty())
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                http::StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+
         let mut create = http::Request::builder()
             .method(http::Method::POST)
-            .uri("/contact")
+            .uri("/std/contact")
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Alice","requested_access":{},"offers":{}}"#))
             .unwrap();
@@ -125,7 +156,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/contacts")
+                    .uri("/std/contacts")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -142,7 +173,7 @@ mod tests {
             app.clone()
                 .oneshot(
                     http::Request::builder()
-                        .uri("/acl/access")
+                        .uri("/std/acl/access")
                         .body(axum::body::Body::empty())
                         .unwrap()
                 )
@@ -155,7 +186,7 @@ mod tests {
             app.clone()
                 .oneshot(
                     http::Request::builder()
-                        .uri("/acl/reviews")
+                        .uri("/std/acl/reviews")
                         .body(axum::body::Body::empty())
                         .unwrap(),
                 )

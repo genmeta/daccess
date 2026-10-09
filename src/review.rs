@@ -93,7 +93,7 @@ impl From<PendingReview> for PendingReviewResponse {
         let review_id = review.id();
         Self {
             review_id,
-            status_url: format!("/acl/review/{review_id}/status"),
+            status_url: format!("/std/acl/review/{review_id}/status"),
         }
     }
 }
@@ -104,7 +104,7 @@ impl From<PendingReview> for PendingReviewResponse {
 pub fn is_review_status_path(method: &http::Method, path: &str) -> bool {
     method == http::Method::GET
         && path
-            .strip_prefix("/acl/review/")
+            .strip_prefix("/std/acl/review/")
             .and_then(|path| path.strip_suffix("/status"))
             .is_some_and(|id| id.parse::<i64>().is_ok())
 }
@@ -155,25 +155,34 @@ mod tests {
 
     #[test]
     fn pending_response_and_status_route_are_canonical() {
+        assert!(!is_review_status_path(
+            &http::Method::GET,
+            "/acl/review/12/status"
+        ));
+        assert!(!is_review_status_path(
+            &http::Method::GET,
+            "/std-extra/acl/review/12/status"
+        ));
+
         let response = PendingReviewResponse::from(PendingReview::new(12));
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             serde_json::json!({
                 "review_id": 12,
-                "status_url": "/acl/review/12/status",
+                "status_url": "/std/acl/review/12/status",
             })
         );
         assert!(is_review_status_path(
             &http::Method::GET,
-            "/acl/review/12/status"
+            "/std/acl/review/12/status"
         ));
         assert!(!is_review_status_path(
             &http::Method::GET,
-            "/acl/review/abc/status"
+            "/std/acl/review/abc/status"
         ));
         assert!(!is_review_status_path(
             &http::Method::POST,
-            "/acl/review/12/status"
+            "/std/acl/review/12/status"
         ));
     }
 }

@@ -86,7 +86,7 @@ impl AccessService {
             .query_all_raw(Statement::from_string(
                 DatabaseBackend::Sqlite,
                 "SELECT method, api, effect, grantee_type, grantee FROM access_rules \
-                 WHERE api = '/acl' OR api LIKE '/acl/%'",
+                 WHERE api = '/std/acl' OR api LIKE '/std/acl/%'",
             ))
             .await?;
         let mut scopes = BTreeMap::<(String, String), (Option<Effect>, bool)>::new();
@@ -672,7 +672,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/acl/apis?page=1&page_size=1")
+                    .uri("/std/acl/apis?page=1&page_size=1")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -691,7 +691,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/acl/apis?page=2&page_size=1")
+                    .uri("/std/acl/apis?page=2&page_size=1")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -706,7 +706,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/acl/apis?page_size=1&sort=api&order=desc")
+                    .uri("/std/acl/apis?page_size=1&sort=api&order=desc")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -720,7 +720,7 @@ mod tests {
         let response = app
             .oneshot(
                 http::Request::builder()
-                    .uri("/acl/access/newer")
+                    .uri("/std/acl/access/newer")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -786,7 +786,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/acl/access")
+                    .uri("/std/acl/access")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -817,7 +817,7 @@ mod tests {
         let response = app
             .oneshot(
                 http::Request::builder()
-                    .uri("/acl/access/api/2")
+                    .uri("/std/acl/access/api/2")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -862,7 +862,7 @@ mod tests {
         let response = crate::api::router(service)
             .oneshot(
                 http::Request::builder()
-                    .uri("/acl/allow")
+                    .uri("/std/acl/allow")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -924,7 +924,7 @@ mod tests {
         let response = crate::api::router(service)
             .oneshot(
                 http::Request::builder()
-                    .uri("/acl/allow/alice.smith~?page=1&page_size=1")
+                    .uri("/std/acl/allow/alice.smith~?page=1&page_size=1")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -973,12 +973,12 @@ mod tests {
         let rule = |method: http::Method, api: &str, effect: &str, grantee: &str| {
             let (uri, body) = if method == http::Method::POST {
                 (
-                    format!("/acl/access/{}", api.trim_start_matches('/')),
+                    format!("/std/acl/access/{}", api.trim_start_matches('/')),
                     format!(r#"{{"method":"GET","effect":"{effect}","grantee":"{grantee}"}}"#),
                 )
             } else {
                 (
-                    format!("/acl/allow/{grantee}"),
+                    format!("/std/acl/allow/{grantee}"),
                     format!(r#"{{"method":"GET","api":"{api}","effect":"{effect}"}}"#),
                 )
             };
@@ -1018,7 +1018,7 @@ mod tests {
         );
         let delete_business_administrator = http::Request::builder()
             .method(http::Method::DELETE)
-            .uri("/contact/bob.example")
+            .uri("/std/contact/bob.example")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(
@@ -1031,7 +1031,12 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(rule(http::Method::POST, "/acl", "deny", "owner.example",))
+                .oneshot(rule(
+                    http::Method::POST,
+                    "/std/acl",
+                    "deny",
+                    "owner.example",
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -1039,7 +1044,12 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(rule(http::Method::POST, "/acl", "allow", "alice.example",))
+                .oneshot(rule(
+                    http::Method::POST,
+                    "/std/acl",
+                    "allow",
+                    "alice.example",
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -1047,7 +1057,12 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(rule(http::Method::POST, "/acl", "deny", "owner.example",))
+                .oneshot(rule(
+                    http::Method::POST,
+                    "/std/acl",
+                    "deny",
+                    "owner.example",
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -1056,9 +1071,11 @@ mod tests {
 
         let delete = http::Request::builder()
             .method(http::Method::DELETE)
-            .uri("/acl/allow/alice.example")
+            .uri("/std/acl/allow/alice.example")
             .header(http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(r#"{"method":"GET","api":"/acl"}"#))
+            .body(axum::body::Body::from(
+                r#"{"method":"GET","api":"/std/acl"}"#,
+            ))
             .unwrap();
         assert_eq!(
             app.clone().oneshot(delete).await.unwrap().status(),
@@ -1066,7 +1083,12 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(rule(http::Method::PATCH, "/acl", "review", "alice.example",))
+                .oneshot(rule(
+                    http::Method::PATCH,
+                    "/std/acl",
+                    "review",
+                    "alice.example",
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -1074,7 +1096,7 @@ mod tests {
         );
         let delete_contact = http::Request::builder()
             .method(http::Method::DELETE)
-            .uri("/contact/alice.example")
+            .uri("/std/contact/alice.example")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(
@@ -1084,7 +1106,12 @@ mod tests {
 
         assert_eq!(
             app.clone()
-                .oneshot(rule(http::Method::POST, "/acl", "allow", "admin@example",))
+                .oneshot(rule(
+                    http::Method::POST,
+                    "/std/acl",
+                    "allow",
+                    "admin@example",
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -1092,7 +1119,12 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(rule(http::Method::PATCH, "/acl", "review", "alice.example",))
+                .oneshot(rule(
+                    http::Method::PATCH,
+                    "/std/acl",
+                    "review",
+                    "alice.example",
+                ))
                 .await
                 .unwrap()
                 .status(),
@@ -1101,9 +1133,11 @@ mod tests {
 
         let delete_group = http::Request::builder()
             .method(http::Method::DELETE)
-            .uri("/acl/allow/admin@example")
+            .uri("/std/acl/allow/admin@example")
             .header(http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(r#"{"method":"GET","api":"/acl"}"#))
+            .body(axum::body::Body::from(
+                r#"{"method":"GET","api":"/std/acl"}"#,
+            ))
             .unwrap();
         assert_eq!(
             app.oneshot(delete_group).await.unwrap().status(),
@@ -1129,7 +1163,7 @@ mod tests {
             service
                 .set_policy(
                     method.clone(),
-                    "/acl",
+                    "/std/acl",
                     Effect::Allow,
                     Grantee::One(name.into()),
                 )
@@ -1139,7 +1173,7 @@ mod tests {
         service
             .set_policy(
                 method.clone(),
-                "/acl",
+                "/std/acl",
                 Effect::Deny,
                 Grantee::One("owner.example".into()),
             )
@@ -1147,8 +1181,12 @@ mod tests {
             .unwrap();
 
         let (alice, bob) = tokio::join!(
-            service.remove_policy(method.clone(), "/acl", Grantee::One("alice.example".into()),),
-            service.remove_policy(method, "/acl", Grantee::One("bob.example".into()),),
+            service.remove_policy(
+                method.clone(),
+                "/std/acl",
+                Grantee::One("alice.example".into()),
+            ),
+            service.remove_policy(method, "/std/acl", Grantee::One("bob.example".into()),),
         );
 
         assert_ne!(alice.is_ok(), bob.is_ok());
@@ -1156,7 +1194,7 @@ mod tests {
             .db
             .query_one_raw(Statement::from_string(
                 DatabaseBackend::Sqlite,
-                "SELECT COUNT(*) AS count FROM access_rules WHERE method = 'GET' AND api = '/acl' AND effect = 'allow' AND grantee_type IN (0, 1)",
+                "SELECT COUNT(*) AS count FROM access_rules WHERE method = 'GET' AND api = '/std/acl' AND effect = 'allow' AND grantee_type IN (0, 1)",
             ))
             .await
             .unwrap()

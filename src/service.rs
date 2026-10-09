@@ -728,7 +728,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/contacts"),
+                    headers(http::Method::GET, "/std/contacts"),
                     Some("me.example"),
                     Some(&SubjectId::new([1]).unwrap())
                 )
@@ -739,7 +739,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/contacts"),
+                    headers(http::Method::GET, "/std/contacts"),
                     Some("other.example"),
                     Some(&SubjectId::new([2]).unwrap())
                 )
@@ -750,7 +750,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/contacts"),
+                    headers(http::Method::GET, "/std/contacts"),
                     Some("me.example"),
                     Some(&SubjectId::new([2]).unwrap())
                 )
@@ -901,7 +901,7 @@ mod tests {
         db.execute_unprepared(
             r#"INSERT INTO access_rules
                (method, api, effect, grantee_type, grantee, updated_at, created_at)
-               VALUES ('*', '/acl', 'allow', 0, 'me.example', 1, 1)"#,
+               VALUES ('*', '/std/acl', 'allow', 0, 'me.example', 1, 1)"#,
         )
         .await
         .unwrap();
@@ -913,7 +913,7 @@ mod tests {
         service
             .remove_policy(
                 Method::Unspecified,
-                "/acl",
+                "/std/acl",
                 Grantee::One(String::from("me.example")),
             )
             .await
@@ -922,7 +922,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/acl/apis"),
+                    headers(http::Method::GET, "/std/acl/apis"),
                     Some("me.example"),
                     Some(&subject_id),
                 )
