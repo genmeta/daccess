@@ -1,9 +1,14 @@
 [package]
-name = "access_control"
+name = "daccess"
 description = "Name-based access control for DHttp"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/genmeta/daccess"
+readme = "README.md"
+
+[lib]
+name = "access_control"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }
