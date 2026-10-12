@@ -49,8 +49,32 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-features --all-targets -- --test-threads=1
 
-      - name: Authenticate to crates.io
+      - name: Determine publication authentication
         if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        id: registry
+        run: |
+          python3 - <<'PY_AUTH'
+          import os
+          import urllib.error
+          import urllib.request
+
+          request = urllib.request.Request(
+              "https://crates.io/api/v1/crates/daccess",
+              headers={"User-Agent": "genmeta daccess publish workflow"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20):
+                  existing = True
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              existing = False
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"existing={str(existing).lower()}\n")
+          PY_AUTH
+
+      - name: Authenticate to crates.io
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && steps.registry.outputs.existing == 'true'
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
 

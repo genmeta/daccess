@@ -35,3 +35,6 @@ The published package is daccess; the Rust library remains access_control.
 Downstream manifests use `access_control = { package = "daccess", version = "0.1.0" }`.
 Configure CARGO_REGISTRY_TOKEN for the first publication. Afterwards configure
 Trusted Publishing for genmeta/daccess and publish-crates.yml.
+
+First publication checks registry existence before requesting OIDC. An unpublished
+crate uses CARGO_REGISTRY_TOKEN; subsequent versions require Trusted Publishing.
