@@ -27,11 +27,11 @@
 
 ```toml
 [dependencies]
-access_control = "0.1"
+access_control = { package = "daccess", version = "0.1.0" }
 ```
 
-在尚未发布到 registry 的联合开发阶段，承载应用应固定一个明确的 Git revision；
-临时 `path` 依赖只用于本地联调，不代表本库属于承载应用的 Cargo workspace。
+发布包名为 `daccess`，Rust 库名保留 `access_control`。首次发布和 CI 认证说明见
+[RELEASING.md](RELEASING.md)。临时 `path` 依赖只用于本地联调。
 
 ### 1. 为 profile 创建 AccessService
 
