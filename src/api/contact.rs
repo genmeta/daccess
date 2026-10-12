@@ -1195,6 +1195,7 @@ mod tests {
     use std::sync::Arc;
 
     use http_body_util::BodyExt;
+    use radix_trie::TrieCommon;
     use sea_orm::{ConnectionTrait, Database, TryGetable};
     use tower::ServiceExt;
 
