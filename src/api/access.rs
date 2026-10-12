@@ -541,7 +541,11 @@ mod tests {
                 .policies
                 .read()
                 .await
-                .evaluate(&http::Method::GET, "/api/item", &[grantee.clone()])
+                .evaluate(
+                    &http::Method::GET,
+                    "/api/item",
+                    std::slice::from_ref(&grantee)
+                )
                 .0,
             Effect::Allow
         );
