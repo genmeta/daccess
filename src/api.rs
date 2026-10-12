@@ -86,7 +86,6 @@ pub(crate) fn database(error: sea_orm::DbErr) -> ApiError {
 #[cfg(test)]
 mod tests {
     use http_body_util::BodyExt;
-    use radix_trie::TrieCommon;
     use sea_orm::{ConnectionTrait, Database};
     use tower::ServiceExt;
 

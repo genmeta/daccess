@@ -83,6 +83,8 @@ pub enum Method {
 }
 
 impl Method {
+    // Preserve the existing conversion API used by policy serialization.
+    #[allow(clippy::inherent_to_string)]
     pub(crate) fn to_string(&self) -> String {
         match self {
             Self::Specified(method) => method.as_str().to_owned(),
