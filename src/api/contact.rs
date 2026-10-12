@@ -1503,7 +1503,12 @@ mod tests {
         invalid.name = "invalid.example".into();
         invalid.requested_access = requested("relative");
         assert!(service.create_contact(invalid).await.is_err());
-        assert_eq!(service.contacts.read().await.len(), 1);
+        let contacts = service.contacts.read().await;
+        assert_eq!(contacts.len(), 2);
+        assert!(contacts.get("owner.example").is_some());
+        assert!(contacts.get("alice.example").is_some());
+        assert!(contacts.get("too-long.example").is_none());
+        assert!(contacts.get("invalid.example").is_none());
     }
 
     #[tokio::test]

@@ -515,6 +515,9 @@ mod tests {
         db.execute_unprepared(include_str!("../migrations/0.sql"))
             .await
             .unwrap();
+        db.execute_unprepared(include_str!("../migrations/1.sql"))
+            .await
+            .unwrap();
         AccessService::new(db, "owner.example")
     }
 
