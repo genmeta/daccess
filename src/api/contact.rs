@@ -140,6 +140,9 @@ pub(crate) struct LocalContactPatchBody {
 
 #[derive(Serialize)]
 pub(crate) struct ContactBody {
+    id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incoming: Option<bool>,
     name: String,
     subject_id: String,
     alias: Option<String>,
@@ -156,6 +159,7 @@ pub(crate) struct ContactBody {
 
 #[derive(Serialize)]
 pub(crate) struct SelfContactStatusBody {
+    id: i64,
     name: String,
     subject_id: String,
     status: ContactStatus,
@@ -314,10 +318,10 @@ impl AccessService {
              ON CONFLICT(name) DO UPDATE SET \
                subject_id = excluded.subject_id, class = excluded.class, offers = excluded.offers, \
                requests = excluded.requests, description = excluded.description, \
-               status = CASE WHEN contacts.status = 4 THEN excluded.status ELSE contacts.status END, \
+               status = CASE WHEN contacts.status IN (0, 4) THEN excluded.status ELSE contacts.status END, \
                expired_after = excluded.expired_after, updated_at = excluded.updated_at, \
                created_at = excluded.created_at \
-             WHERE contacts.status IN (2, 3, 4)",
+             WHERE contacts.status IN (0, 2, 3, 4)",
             [
                 contact.name.as_str().into(),
                 contact.subject_id.as_bytes().to_vec().into(),
@@ -327,6 +331,16 @@ impl AccessService {
             ],
         )).await?;
         require_contact_update(&transaction, result.rows_affected(), &contact.name).await?;
+        // A fresh application supersedes pending receipts, while retries of an
+        // existing application_id return above without replacing the contact.
+        transaction
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE contact_applications SET status = 'revoked' \
+             WHERE applicant_name = ? AND status = 'pending'",
+                [contact.name.as_str().into()],
+            ))
+            .await?;
         let status = if matches!(previous_status, Some(2 | 3))
             || initial_status == ContactStatus::Active as i32
         {
@@ -395,7 +409,7 @@ impl AccessService {
         limit: i64,
         sort: Sort,
         order: Order,
-    ) -> Result<(u64, Vec<ContactRecord>), DbErr> {
+    ) -> Result<(u64, Vec<ContactBody>), DbErr> {
         expire_pending_contacts(&self.db, None).await?;
         let total = self
             .db
@@ -412,7 +426,7 @@ impl AccessService {
             ", name ASC"
         };
         let sql = format!(
-            "SELECT name, subject_id, alias, class, description, status, expired_after, updated_at, created_at, requests, grants, offers FROM contacts \
+            "SELECT id, name, subject_id, alias, class, description, status, expired_after, updated_at, created_at, requests, grants, offers, EXISTS(SELECT 1 FROM contact_applications a WHERE a.applicant_name = contacts.name AND a.applicant_sid = contacts.subject_id) AS incoming FROM contacts \
              ORDER BY {} {}{} LIMIT ? OFFSET ?",
             sort.column(),
             order_sql(&order),
@@ -427,7 +441,11 @@ impl AccessService {
             ))
             .await?
             .into_iter()
-            .map(decode_contact)
+            .map(|row| {
+                let id = row.try_get("", "id")?;
+                let incoming = row.try_get::<i64>("", "incoming")? != 0;
+                Ok::<_, DbErr>(contact_body(decode_contact(row)?, id, Some(incoming)))
+            })
             .collect::<Result<_, _>>()?;
         Ok((total, contacts))
     }
@@ -1015,24 +1033,39 @@ pub(crate) async fn list(
         .list_contacts(offset, limit, query.sort, query.order)
         .await
         .map_err(crate::api::database)?;
-    Ok(axum::Json(Page::new(
-        contacts.into_iter().map(ContactBody::from).collect(),
-        total,
-        pagination,
-    )))
+    Ok(axum::Json(Page::new(contacts, total, pagination)))
 }
 
 pub(crate) async fn get(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<axum::Json<ContactBody>, crate::api::ApiError> {
-    state
+    let contact = state
         .service
         .find_contact_by_name(&name)
         .await
-        .map(ContactBody::from)
-        .map(axum::Json)
-        .map_err(crate::api::database)
+        .map_err(crate::api::database)?;
+    let id = contact_id(&state.service, &name, &contact.subject_id)
+        .await
+        .map_err(crate::api::database)?;
+    Ok(axum::Json(contact_body(contact, id, None)))
+}
+
+async fn contact_id(
+    service: &AccessService,
+    name: &str,
+    subject: &SubjectId,
+) -> Result<i64, DbErr> {
+    let row = service
+        .database()
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT id FROM contacts WHERE name = ? AND subject_id = ?",
+            [name.into(), subject.as_bytes().to_vec().into()],
+        ))
+        .await?
+        .ok_or_else(|| DbErr::RecordNotFound(name.into()))?;
+    row.try_get("", "id")
 }
 
 pub(crate) async fn self_status(
@@ -1085,6 +1118,9 @@ pub(crate) async fn self_status(
     };
     Ok(axum::Json(
         serde_json::to_value(SelfContactStatusBody {
+            id: contact_id(&state.service, visitor.name(), visitor.subject_id())
+                .await
+                .map_err(crate::api::database)?,
             name: visitor.name().to_owned(),
             subject_id: String::from_utf8_lossy(visitor.subject_id().as_bytes()).into_owned(),
             status,
@@ -1170,23 +1206,23 @@ fn contact_subject_id_text(subject_id: &SubjectId) -> String {
     }
 }
 
-impl From<ContactRecord> for ContactBody {
-    fn from(value: ContactRecord) -> Self {
-        Self {
-            name: value.name,
-            subject_id: contact_subject_id_text(&value.subject_id),
-            alias: value.alias,
-            class: value.class,
-            description: value.description,
-            status: ContactStatus::try_from(value.status)
-                .expect("contact status is constrained by the database schema"),
-            created_at: value.created_at,
-            updated_at: value.updated_at,
-            expired_after: value.expired_after,
-            requested_access: value.requested_access,
-            granted_access: value.granted_access,
-            offers: value.offers,
-        }
+fn contact_body(value: ContactRecord, id: i64, incoming: Option<bool>) -> ContactBody {
+    ContactBody {
+        id,
+        incoming,
+        name: value.name,
+        subject_id: contact_subject_id_text(&value.subject_id),
+        alias: value.alias,
+        class: value.class,
+        description: value.description,
+        status: ContactStatus::try_from(value.status)
+            .expect("contact status is constrained by the database schema"),
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        expired_after: value.expired_after,
+        requested_access: value.requested_access,
+        granted_access: value.granted_access,
+        offers: value.offers,
     }
 }
 
@@ -1950,7 +1986,7 @@ mod tests {
         );
         assert_eq!(
             app.clone().oneshot(duplicate).await.unwrap().status(),
-            http::StatusCode::CONFLICT
+            http::StatusCode::CREATED
         );
 
         let get = request(http::Method::GET, "/std/contact/alice.example", "");
@@ -1959,8 +1995,8 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["subject_id"], "verified-subject");
-        assert_eq!(body["class"], "agent");
-        assert_eq!(body["description"], "Alice");
+        assert_eq!(body["class"], "service");
+        assert_eq!(body["description"], "Updated Alice");
         assert_eq!(body["status"], "pending");
         assert_eq!(body["updated_at"], body["created_at"]);
         assert_eq!(
@@ -1989,6 +2025,139 @@ mod tests {
             app.oneshot(missing).await.unwrap().status(),
             http::StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn new_application_supersedes_pending_receipts_without_replaying_old_payloads() {
+        for without_permissions in [false, true] {
+            let service = service().await;
+            let first_id = "a".repeat(64);
+            let next_id = "b".repeat(64);
+            let first_hash = "1".repeat(64);
+            let next_hash = "2".repeat(64);
+            service
+                .create_application(contact(), &first_id, &first_hash)
+                .await
+                .unwrap();
+            let mut replacement = contact();
+            replacement.description = "Latest introduction".into();
+            replacement.created_at += 10;
+            replacement.updated_at += 10;
+            replacement.expired_after += 10;
+            replacement.requested_access = if without_permissions {
+                RequestedAccess::new()
+            } else {
+                requested("/latest")
+            };
+            replacement.offers = granted("/latest-offer", Effect::Allow);
+            let (receipt, created) = service
+                .create_application(replacement.clone(), &next_id, &next_hash)
+                .await
+                .unwrap();
+            assert!(created);
+            assert_eq!(
+                receipt.status,
+                if without_permissions {
+                    "active"
+                } else {
+                    "pending"
+                }
+            );
+            let latest = service.find_contact_by_name("alice.example").await.unwrap();
+            assert_eq!(latest.description, replacement.description);
+            assert_eq!(latest.requested_access, replacement.requested_access);
+            assert_eq!(latest.offers, replacement.offers);
+            assert_eq!(latest.created_at, replacement.created_at);
+            assert_eq!(latest.expired_after, replacement.expired_after);
+            assert_eq!(latest.status, if without_permissions { 2 } else { 0 });
+            let (old, created) = service
+                .create_application(contact(), &first_id, &first_hash)
+                .await
+                .unwrap();
+            assert!(!created);
+            assert_eq!(old.status, "revoked");
+            assert_eq!(
+                service.find_contact_by_name("alice.example").await.unwrap(),
+                latest
+            );
+            let (retry, created) = service
+                .create_application(replacement.clone(), &next_id, &next_hash)
+                .await
+                .unwrap();
+            assert!(!created);
+            assert_eq!(retry.received_at, receipt.received_at);
+            assert_eq!(retry.expired_after, receipt.expired_after);
+            assert!(
+                service
+                    .create_application(replacement, &next_id, &first_hash)
+                    .await
+                    .is_err()
+            );
+            if !without_permissions {
+                service
+                    .patch_contact(
+                        "alice.example",
+                        ContactPatch::LocalUpdate {
+                            status: Some(ContactStatus::Active),
+                            alias: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                service.find_application(&first_id).await.unwrap().status,
+                "revoked"
+            );
+            assert_eq!(
+                service.find_application(&next_id).await.unwrap().status,
+                "active"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_application_respects_blocking_and_active_subject_identity() {
+        for blocked in [false, true] {
+            let service = service().await;
+            let mut initial = contact();
+            initial.requested_access.clear();
+            let first_id = "a".repeat(64);
+            let hash = "1".repeat(64);
+            service
+                .create_application(initial, &first_id, &hash)
+                .await
+                .unwrap();
+            if blocked {
+                service
+                    .patch_contact(
+                        "alice.example",
+                        ContactPatch::LocalUpdate {
+                            status: Some(ContactStatus::Blocked),
+                            alias: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let before = service.find_contact_by_name("alice.example").await.unwrap();
+            let mut replacement = contact();
+            if !blocked {
+                replacement.subject_id = SubjectId::new([2]).unwrap();
+            }
+            let next_id = "b".repeat(64);
+            assert!(
+                service
+                    .create_application(replacement, &next_id, &hash)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                service.find_contact_by_name("alice.example").await.unwrap(),
+                before
+            );
+            assert!(service.find_application(&next_id).await.is_err());
+        }
     }
 
     #[tokio::test]

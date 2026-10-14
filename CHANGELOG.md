@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add owner-authenticated contact resource PUT and retry semantics without importing access rules.
+- Return derived contact id and list incoming direction for the host integration.
+- Use the crate-named library root src/daccess.rs.
+
 ## [0.1.0] - 2026-10-12
 
 ### Changed

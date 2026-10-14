@@ -9,6 +9,7 @@ readme = "README.md"
 
 [lib]
 name = "access_control"
+path = "src/daccess.rs"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }

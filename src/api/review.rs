@@ -22,6 +22,7 @@ pub enum ReviewRecord {
 #[derive(Serialize)]
 pub(crate) struct ReviewBody {
     id: i64,
+    requested_at: i64,
     visitor: String,
     method: String,
     api: String,
@@ -118,28 +119,6 @@ fn decode_timestamp(value: i64) -> Result<DateTime<Utc>, DbErr> {
         .ok_or_else(|| DbErr::Type(format!("invalid UTC timestamp {value}")))
 }
 
-impl From<ReviewRecord> for ReviewBody {
-    fn from(review: ReviewRecord) -> Self {
-        match review {
-            ReviewRecord::Persistent {
-                id,
-                visitor,
-                method,
-                api,
-                reason,
-                expired_after,
-            } => Self {
-                id,
-                visitor,
-                method,
-                api,
-                reason,
-                expired_after,
-            },
-        }
-    }
-}
-
 fn status_name(status: ReviewStatus) -> &'static str {
     match status {
         ReviewStatus::Pending => "pending",
@@ -152,18 +131,46 @@ fn status_name(status: ReviewStatus) -> &'static str {
 pub(crate) async fn list_persistent(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
     axum::extract::Query(pagination): axum::extract::Query<Pagination>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<axum::Json<Page<Vec<ReviewBody>>>, crate::api::ApiError> {
+    let comparison = match query.get("status").map(String::as_str).unwrap_or("pending") {
+        "pending" => ">",
+        "expired" => "<=",
+        _ => return Err(crate::api::bad_request("status must be pending or expired")),
+    };
     let (offset, limit) = pagination.offset_limit()?;
-    let (total, reviews) = state
-        .service
-        .pending_persistent_reviews(offset, limit)
+    let condition =
+        format!("stage=0 AND expired_after {comparison} CAST(strftime('%s','now') AS INTEGER)");
+    let db = state.service.database();
+    let total = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!("SELECT count(*) AS total FROM access_reviews WHERE {condition}"),
+        ))
         .await
+        .map_err(crate::api::database)?
+        .unwrap();
+    let total = i64::try_get(&total, "", "total")
+        .map_err(|error| crate::api::database(error.into()))? as u64;
+    let rows = db.query_all_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        format!("SELECT id,visitor,method,api,reason,created_at,expired_after FROM access_reviews WHERE {condition} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?"),
+        [limit.into(),offset.into()])).await.map_err(crate::api::database)?;
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            Ok(ReviewBody {
+                id: row.try_get("", "id")?,
+                requested_at: row.try_get("", "created_at")?,
+                visitor: row.try_get("", "visitor")?,
+                method: row.try_get("", "method")?,
+                api: row.try_get("", "api")?,
+                reason: row.try_get("", "reason")?,
+                expired_after: decode_timestamp(row.try_get("", "expired_after")?)?,
+            })
+        })
+        .collect::<Result<Vec<_>, DbErr>>()
         .map_err(crate::api::database)?;
-    Ok(axum::Json(Page::new(
-        reviews.into_iter().map(ReviewBody::from).collect(),
-        total,
-        pagination,
-    )))
+    Ok(axum::Json(Page::new(items, total, pagination)))
 }
 
 pub(crate) async fn status(
@@ -275,5 +282,75 @@ mod tests {
             .insert(Visitor::new("alice.example", SubjectId::new([1]).unwrap()));
         let allowed = app.oneshot(request).await.unwrap();
         assert_eq!(allowed.status(), http::StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    #[tokio::test]
+    async fn expired_reviews_are_queryable_and_only_expired_pending_records_can_be_deleted() {
+        let service = std::sync::Arc::new(
+            AccessService::load_from_db(
+                "sqlite::memory:",
+                "owner.example",
+                &crate::SubjectId::new(b"owner".to_vec()).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let time = Utc::now().timestamp();
+        service.database().execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+            "INSERT INTO access_reviews(id,request_id,visitor,visitor_sid,method,api,stage,reason,expired_after,created_at,updated_at) VALUES(1,'expired','alice',?,'GET','/private',0,'expired',?,?,?),(2,'pending','alice',?,'GET','/private',0,'pending',?,?,?),(3,'decided','alice',?,'GET','/private',1,'decided',?,?,?)",
+            vec![b"alice".to_vec().into(),(time-1).into(),(time-30).into(),(time-30).into(),b"alice".to_vec().into(),(time+30).into(),time.into(),time.into(),b"alice".to_vec().into(),(time-1).into(),(time-30).into(),(time-30).into()])).await.unwrap();
+        let app = crate::api::router(service);
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/std/acl/reviews?status=expired")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(value["total"], 1);
+        assert_eq!(value["items"][0]["id"], 1);
+        assert_eq!(value["items"][0]["requested_at"], time - 30);
+        for (id, status) in [(2, 404), (3, 404), (1, 204), (1, 404)] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        http::Request::builder()
+                            .method("DELETE")
+                            .uri(format!("/std/acl/review/{id}"))
+                            .body(Body::empty())
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                status
+            );
+        }
+        assert_eq!(
+            app.oneshot(
+                http::Request::builder()
+                    .uri("/std/acl/reviews?status=other")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+            400
+        );
     }
 }

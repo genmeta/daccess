@@ -216,7 +216,7 @@ license     = Apache-2.0
 |   4 | Expired   | Pending 申请超过有效期且未获批准     |
 |   5 | Blocked   | 已被本方拉黑，拒绝重新申请和权限更新 |
 
-首次 HTTP 创建时，含权限请求的申请写入 Pending；没有请求任何权限的申请直接写入 Active，无须单独批准“联系人关系”。接收方以收到请求的时间写入 `created_at` 和 `updated_at`，并将 `expired_after` 设为收到时间后 7 天。相同 `application_id`、认证身份和载荷的重试返回原记录，不重置有效期；编号被其他身份或不同载荷复用时返回冲突。新的申请编号可在前一申请过期后重新申请；Blocked 身份不可申请。
+首次 HTTP 创建时，含权限请求的申请写入 Pending；没有请求任何权限的申请直接写入 Active，无须单独批准“联系人关系”。接收方以收到请求的时间写入 `created_at` 和 `updated_at`，并将 `expired_after` 设为收到时间后 7 天。相同 `application_id`、认证身份和载荷的重试返回原记录，不重置有效期；编号被其他身份或不同载荷复用时返回冲突。同一申请人使用新的申请编号重新申请时，以接收端收到的新申请为准：在同一事务内更新联系人介绍、请求、提供权限和有效期，并将该名称下原 pending 回执标记 revoked。新申请仍按是否请求权限决定 Pending/Active；已 Active/Transfered 联系人的既有状态和精确 ACL 不因重新申请改变。旧编号重试只返回原回执，不恢复旧载荷；旧编号查询仍核对原认证身份。Blocked 身份和已 Active 联系人的不同 SubjectId 申请仍拒绝。
 
 `contact_applications` 按 `application_id` 保存认证申请人名称与 SubjectId、载荷摘要、收到时间、失效时间和 pending/active/expired/denied/revoked 状态。它与联系人写入在同一事务中完成，并在联系人删除后保留供幂等重试和状态查询。删除待处理联系人将对应申请标记 denied；删除已激活联系人标记 revoked。
 
@@ -506,6 +506,14 @@ license     = Apache-2.0
 `status` 使用 `pending`、`active`、`transfered`、`expired` 或
 `blocked`。数据库继续使用第 5.2 节定义的整数表示；整数值不属于 HTTP
 接口契约。
+
+#### `PUT /std/contact/{name}`
+
+本端 owner 管理联系人资源。除统一 ACL 外，处理器核对经过认证 Visitor 的名称及 SubjectId 均属于服务 owner；不得写 owner 的保留名称。JSON 仅接受 subject_id、class、description、status、requested_access、offers、expired_after。description 必填且最多80个字符；status 只允许 pending/active，省略默认为 pending。过期时刻必须晚于当前时间，首次省略使用7天。
+
+首次创建返回201，已有资源的相同内容重试返回204；blocked 等不允许替换的状态返回409。启用复用库已有联系人状态转换，失败时可以相同请求重试。offers/requested_access 是声明，不自动生成授权规则，granted_access 不接受客户端写入。表及 schema version 不变。
+
+联系人 GET 响应增加数据库行 id；列表项还包含 incoming，表示是否存在该名称/SubjectId 对应的已收到申请。无 application_id 的 self 状态响应也包含 id。id 从当前数据库派生，不是替代可信身份的授权依据；申请编号查询保持原协议。
 
 #### `PATCH /std/contact/{name}`
 
@@ -864,3 +872,7 @@ header 或路径中声明的联系人名称。实现必须复核保存的 Subjec
 - `access/src/policy.rs`，规则表示与匹配算法的权威实现。
 - `access/src/service.rs`，加载、授权与持久审批流程的权威实现。
 - `access/src/api.rs` 及 `access/src/api/`，HTTP 管理协议的权威实现。
+
+## Workspace WASM 资源接入（2026-10-13）
+
+GET /std/acl/reviews 支持 status=pending|expired，默认 pending；只查询 stage=0，保持分页，并返回 requested_at（原 created_at 的 Unix 秒数）。expired_after 保持原 UTC RFC3339 格式。DELETE /std/acl/review/{id} 只删除已经过期的 pending 审批；有效、已决定及不存在记录返回404。管理路由仍由宿主真实身份与现有 ACL 授权，数据库 schema、ReviewRecord 和 AccessService 的公开方法不变。
