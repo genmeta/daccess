@@ -1,10 +1,26 @@
 # Changelog
 
-## Unreleased
+## [0.1.1] - 2026-10-14
 
-- Add owner-authenticated contact resource PUT and retry semantics without importing access rules.
-- Return derived contact id and list incoming direction for the host integration.
-- Use the crate-named library root src/daccess.rs.
+### Added
+
+- Add owner-authenticated `PUT /std/contact/{name}` with retry semantics and no implicit access grants.
+- Return derived contact ids and the incoming direction in contact lists.
+- Query expired pending reviews with `GET /std/acl/reviews?status=expired`, return `requested_at`, and delete them through `DELETE /std/acl/review/{id}`.
+
+### Fixed
+
+- Accept fresh contact applications from the same authenticated applicant and revoke superseded pending receipts atomically; preserve active contacts, exact access rules and old application retry results.
+
+### Changed
+
+- Use the crate-named library root `src/daccess.rs`; retain the `access_control` Rust library name, public service API and database schema.
+
+### Release versions
+
+| Package | Previous published version | Prepared version |
+| --- | --- | --- |
+| `daccess` | 0.1.0 | 0.1.1 |
 
 ## [0.1.0] - 2026-10-12
 

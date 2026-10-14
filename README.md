@@ -27,7 +27,7 @@
 
 ```toml
 [dependencies]
-access_control = { package = "daccess", version = "0.1.0" }
+access_control = { package = "daccess", version = "0.1.1" }
 ```
 
 发布包名为 `daccess`，Rust 库名保留 `access_control`。首次发布和 CI 认证说明见

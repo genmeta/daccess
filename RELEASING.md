@@ -1,40 +1,25 @@
-# Release preparation for v0.1.0
+# Release preparation for v0.1.1
 
 | Package | Previous published version | Prepared version |
 | --- | --- | --- |
-| `daccess` | first release | 0.1.0 |
+| `daccess` | 0.1.0 | 0.1.1 |
 
-## Dependency order
+## Scope and dependencies
 
-No unpublished Genmeta upstream dependencies.
+This patch release adds owner-managed contact resources, derived contact response fields and expired review management, and fixes fresh application replacement. The public Rust service API, library name and database schema remain unchanged. See [CHANGELOG.md](CHANGELOG.md) and [SPEC.md](SPEC.md).
 
-Manifest versions use Cargo's compatible-version requirements, without `=`.
-They allow patch updates within the selected 0.x series. External Genmeta
-dependencies come from crates.io; no sibling checkout or Git patch is required.
-The dquic TLS backend is the published qrustls 0.23.45 package, used as `rustls`
-where the application exchanges TLS types with qtls.
+There are no unpublished Genmeta upstream dependencies. Manifest versions use Cargo's compatible-version requirements. No sibling checkout or Git patch is required.
 
 ## Validation and lockfiles
 
-This PR is release preparation. Unpublished upstream versions can make CI fail;
-such failures do not confirm compilation, tests or package verification.
-For tracked lockfiles, run `cargo generate-lockfile` after upstream publication,
-review and commit the resulting registry lockfile before tagging.
-Run Cargo from a checkout outside directories containing ancestor path patches.
-Never commit a lockfile generated with local transport path overrides as the
-registry release lockfile. Re-run the normal CI checks and publish dry run after
-upstream publication and lockfile refresh; merge and tag only that checked commit.
+Keep the tracked Cargo.lock resolved from crates.io. Run Cargo from a checkout outside directories containing ancestor path patches; do not commit a lockfile generated with local overrides. Preserve unrelated dependency versions when refreshing the release lockfile.
+
+Before merging and tagging, require formatting, Clippy, tests and the publish dry run in the existing `publish-crates.yml` workflow to pass on the release commit. Local manifest, lockfile and package-content checks do not replace compilation or runtime tests.
 
 ## Publication
 
-Planned tag: `v0.1.0`. Release through the repository's GitHub Actions workflow.
-Use an annotated tag with the changelog entry as its release notes. Actual
-publication and production deployment remain separate from this preparation PR.
+Planned tag: `v0.1.1`. After the preparation PR is merged and its checks pass, use an annotated tag with the changelog entry as its release notes. Tag-triggered GitHub Actions publishes the crate and creates the GitHub Release; preparation does not publish or deploy.
 
-The published package is daccess; the Rust library remains access_control.
-Downstream manifests use `access_control = { package = "daccess", version = "0.1.0" }`.
-Configure CARGO_REGISTRY_TOKEN for the first publication. Afterwards configure
-Trusted Publishing for genmeta/daccess and publish-crates.yml.
+The published package is `daccess`; the Rust library remains `access_control`. Downstream manifests use `access_control = { package = "daccess", version = "0.1.1" }`.
 
-First publication checks registry existence before requesting OIDC. An unpublished
-crate uses CARGO_REGISTRY_TOKEN; subsequent versions require Trusted Publishing.
+Configure Trusted Publishing for genmeta/daccess and `publish-crates.yml`. The existing workflow uses OIDC for subsequent versions; the API-token bootstrap remains available only for first publication of a missing crate.
