@@ -170,16 +170,15 @@ async fn put_contact(
             && record.offers == offers
             && record.expired_after == expires
     });
-    if let Some(record) = &existing {
-        if !matches!(record.status, 0 | 2 | 3)
+    if let Some(record) = &existing
+        && (!matches!(record.status, 0 | 2 | 3)
             || (record.status == 0 && !same)
-            || (record.status == 2 && status != ContactStatus::Active)
-        {
-            return Err((
-                http::StatusCode::CONFLICT,
-                "contact cannot be replaced in its current state".into(),
-            ));
-        }
+            || (record.status == 2 && status != ContactStatus::Active))
+    {
+        return Err((
+            http::StatusCode::CONFLICT,
+            "contact cannot be replaced in its current state".into(),
+        ));
     }
     if !same {
         service
