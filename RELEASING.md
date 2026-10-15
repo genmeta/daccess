@@ -22,4 +22,4 @@ Planned tag: `v0.1.1`. After the preparation PR is merged and its checks pass, u
 
 The published package is `daccess`; the Rust library remains `access_control`. Downstream manifests use `access_control = { package = "daccess", version = "0.1.1" }`.
 
-Configure Trusted Publishing for genmeta/daccess and `publish-crates.yml`. The existing workflow uses OIDC for subsequent versions; the API-token bootstrap remains available only for first publication of a missing crate.
+The workflow uses the existing `CARGO_REGISTRY_TOKEN` repository secret when configured, for both first and subsequent publications. Without that secret, existing crates use Trusted Publishing for genmeta/daccess and `publish-crates.yml`; first publication requires an API token.
