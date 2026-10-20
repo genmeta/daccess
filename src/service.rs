@@ -21,11 +21,12 @@ pub struct AccessService {
 }
 
 impl AccessService {
-    const MIGRATIONS: [&'static str; 2] = [
+    const MIGRATIONS: [&'static str; 3] = [
         include_str!("migrations/0.sql"),
         include_str!("migrations/1.sql"),
+        include_str!("migrations/2.sql"),
     ];
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
 
     pub fn new(db: DatabaseConnection, owner_name: impl Into<String>) -> Self {
         Self {
@@ -57,6 +58,18 @@ impl AccessService {
 
         if !module_exists {
             let transaction = db.begin().await?;
+            if transaction
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1",
+                ))
+                .await?
+                .is_some()
+            {
+                return Err(DbErr::Type(String::from(
+                    "unrecognized access database format",
+                )));
+            }
             transaction.execute_unprepared(Self::MIGRATIONS[0]).await?;
             transaction.commit().await?;
         }
@@ -69,18 +82,24 @@ impl AccessService {
             .await?
             .ok_or_else(|| DbErr::Type(String::from("module table is empty")))?;
         let version = i64::try_get(&module, "", "version")?;
-        if version == 0 {
+        if !(0..=i64::from(Self::VERSION)).contains(&version) {
+            return Err(DbErr::Type(format!(
+                "unsupported access database version {version}"
+            )));
+        }
+        for next in (version + 1)..=i64::from(Self::VERSION) {
             let transaction = db.begin().await?;
-            transaction.execute_unprepared(Self::MIGRATIONS[1]).await?;
             transaction
-                .execute_unprepared("UPDATE module SET version = 1 WHERE module_name = 'access'")
+                .execute_unprepared(Self::MIGRATIONS[next as usize])
+                .await?;
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE module SET version = ? WHERE module_name = 'access'",
+                    [next.into()],
+                ))
                 .await?;
             transaction.commit().await?;
-        } else if version != i64::from(Self::VERSION) {
-            return Err(DbErr::Type(format!(
-                "unsupported access database version {version}; expected schema version {}",
-                Self::VERSION,
-            )));
         }
         Ok(())
     }
@@ -701,7 +720,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(i64::try_get(&module, "", "version").unwrap(), 1);
+        assert_eq!(i64::try_get(&module, "", "version").unwrap(), 2);
         let columns = service
             .db
             .query_all_raw(Statement::from_string(
@@ -728,7 +747,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/std/contacts"),
+                    headers(http::Method::GET, "/std/contact/list"),
                     Some("me.example"),
                     Some(&SubjectId::new([1]).unwrap())
                 )
@@ -739,7 +758,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/std/contacts"),
+                    headers(http::Method::GET, "/std/contact/list"),
                     Some("other.example"),
                     Some(&SubjectId::new([2]).unwrap())
                 )
@@ -750,7 +769,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/std/contacts"),
+                    headers(http::Method::GET, "/std/contact/list"),
                     Some("me.example"),
                     Some(&SubjectId::new([2]).unwrap())
                 )
@@ -766,7 +785,7 @@ mod tests {
         db.execute_unprepared(AccessService::MIGRATIONS[0])
             .await
             .unwrap();
-        db.execute_unprepared("UPDATE module SET version = 2")
+        db.execute_unprepared("UPDATE module SET version = 99")
             .await
             .unwrap();
 
