@@ -53,7 +53,7 @@ pub fn router(service: Arc<AccessService>) -> Router {
                 else { Ok(http::StatusCode::NO_CONTENT) }
             }
         ))
-        .route("/std/acl/review/{id}/status", get(review::status))
+        .route("/std/acl/status/{id}", get(review::status))
         .with_state(ApiState { service })
 }
 

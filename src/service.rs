@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use crate::{
     Effect, Grantee, Headers, Method, PendingReview, Policies, ReviewStatus, SubjectId,
     policy::{PolicyError, database_api},
-    review::RequestId,
+    review::{LiveReviews, RequestId},
 };
 
 pub struct AccessService {
@@ -18,6 +18,7 @@ pub struct AccessService {
     pub(crate) owner_name: String,
     pub(crate) contacts: RwLock<Trie<String, SubjectId>>,
     pub(crate) policies: RwLock<Policies>,
+    pub(crate) reviews: LiveReviews,
 }
 
 impl AccessService {
@@ -34,6 +35,7 @@ impl AccessService {
             owner_name: owner_name.into(),
             contacts: RwLock::new(Trie::new()),
             policies: RwLock::new(Policies::default()),
+            reviews: LiveReviews::default(),
         }
     }
 
@@ -133,6 +135,7 @@ impl AccessService {
             owner_name: owner_name.to_owned(),
             contacts: RwLock::new(contacts),
             policies: RwLock::new(policies),
+            reviews: LiveReviews::default(),
         })
     }
 
@@ -185,6 +188,7 @@ impl AccessService {
         name: Option<&str>,
         subject_id: Option<&SubjectId>,
     ) -> Result<AuthResult, DbErr> {
+        let mode = crate::ReviewMode::from_headers(&headers.fields)?;
         if name.is_some() != subject_id.is_some() {
             return Err(DbErr::Type(String::from(
                 "name and subject_id must either both be present or both be absent",
@@ -206,11 +210,10 @@ impl AccessService {
             Some(name) => vec![Grantee::One(name.to_owned()), Grantee::Named, Grantee::All],
             None => vec![Grantee::Anony, Grantee::All],
         };
-        let (policy_effect, policy_method, policy_api, policy_grantee) = self
-            .policies
-            .read()
-            .await
-            .evaluate(&headers.method, &api, &grantees);
+        // Keep registration and policy evaluation atomic with respect to a review decision.
+        let policies = self.policies.read().await;
+        let (policy_effect, policy_method, policy_api, policy_grantee) =
+            policies.evaluate(&headers.method, &api, &grantees);
         let subject_changed = match (name, subject_id) {
             (Some(name), Some(subject_id)) => self
                 .contacts
@@ -221,7 +224,12 @@ impl AccessService {
             _ => false,
         };
         let reason = match policy_effect {
-            Effect::Allow if subject_changed => String::from("subject_id changed"),
+            Effect::Allow
+                if subject_changed
+                    && matches!(policy_grantee, Grantee::One(_) | Grantee::Group { .. }) =>
+            {
+                String::from("subject_id changed")
+            }
             Effect::Allow => return Ok(AuthResult::Allowed),
             Effect::Deny => return Ok(AuthResult::Denied),
             Effect::Review => format!(
@@ -237,8 +245,16 @@ impl AccessService {
             // initiated it. Anonymous review requests therefore fail closed.
             return Ok(AuthResult::Denied);
         };
+        if mode == crate::ReviewMode::Waiting {
+            return Ok(AuthResult::Waiting(self.reviews.add(
+                visitor,
+                visitor_sid,
+                &headers,
+                reason,
+            )));
+        }
         let request_id = RequestId::for_request(&headers, visitor, visitor_sid);
-        match self
+        let id = self
             .persistent_review(
                 visitor,
                 visitor_sid,
@@ -247,12 +263,8 @@ impl AccessService {
                 &api,
                 &reason,
             )
-            .await?
-        {
-            StoredReviewStatus::Allowed => Ok(AuthResult::Allowed),
-            StoredReviewStatus::Denied => Ok(AuthResult::Denied),
-            StoredReviewStatus::Pending(id) => Ok(AuthResult::Reviewing(PendingReview::new(id))),
-        }
+            .await?;
+        Ok(AuthResult::Reviewing(PendingReview::new(id)))
     }
 
     async fn persistent_review(
@@ -263,40 +275,8 @@ impl AccessService {
         method: &str,
         api: &str,
         reason: &str,
-    ) -> Result<StoredReviewStatus, DbErr> {
+    ) -> Result<i64, DbErr> {
         let transaction = self.db.begin().await?;
-        let decided = transaction
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                r#"DELETE FROM access_reviews
-                   WHERE visitor = ? AND request_id = ? AND visitor_sid = ?
-                     AND method = ? AND api = ?
-                     AND stage IN (1, 2)
-                     AND expired_after > CAST(strftime('%s', 'now') AS INTEGER)
-                   RETURNING stage"#,
-                [
-                    visitor.into(),
-                    request_id.into(),
-                    visitor_sid.as_bytes().to_vec().into(),
-                    method.into(),
-                    api.into(),
-                ],
-            ))
-            .await?;
-        if let Some(row) = decided {
-            let review = match i32::try_get(&row, "", "stage")? {
-                1 => StoredReviewStatus::Allowed,
-                2 => StoredReviewStatus::Denied,
-                stage => {
-                    return Err(DbErr::Type(format!(
-                        "invalid persistent review stage {stage}"
-                    )));
-                }
-            };
-            transaction.commit().await?;
-            return Ok(review);
-        }
-
         let row = transaction
             .query_one_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
@@ -337,7 +317,7 @@ impl AccessService {
                 "id",
             )?;
             transaction.commit().await?;
-            return Ok(StoredReviewStatus::Pending(id));
+            return Ok(id);
         };
 
         let id = i64::try_get(&row, "", "id")?;
@@ -357,18 +337,7 @@ impl AccessService {
                 "request ID for {visitor:?} is already bound to another subject_id"
             )));
         }
-        let review = if valid {
-            match stage {
-                0 => StoredReviewStatus::Pending(id),
-                1 => StoredReviewStatus::Allowed,
-                2 => StoredReviewStatus::Denied,
-                _ => {
-                    return Err(DbErr::Type(format!(
-                        "invalid persistent review stage {stage}"
-                    )));
-                }
-            }
-        } else {
+        if !valid || stage != 0 {
             transaction
                 .execute_raw(Statement::from_sql_and_values(
                     DatabaseBackend::Sqlite,
@@ -386,11 +355,10 @@ impl AccessService {
                     ],
                 ))
                 .await?;
-            StoredReviewStatus::Pending(id)
-        };
+        }
 
         transaction.commit().await?;
-        Ok(review)
+        Ok(id)
     }
 
     pub fn database(&self) -> &DatabaseConnection {
@@ -417,7 +385,7 @@ impl AccessService {
             ))
             .await?
             .ok_or_else(|| DbErr::RecordNotFound(format!("review {id}")))?;
-        if i32::try_get(&row, "", "valid")? == 0 {
+        if i32::try_get(&row, "", "stage")? == 0 && i32::try_get(&row, "", "valid")? == 0 {
             return Ok(ReviewStatus::Expired);
         }
         match i32::try_get(&row, "", "stage")? {
@@ -431,18 +399,12 @@ impl AccessService {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum AuthResult {
     Allowed,
     Denied,
     Reviewing(PendingReview),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StoredReviewStatus {
-    Pending(i64),
-    Allowed,
-    Denied,
+    Waiting(crate::LiveReview),
 }
 
 impl From<PolicyError> for DbErr {
@@ -1123,6 +1085,7 @@ mod tests {
     #[tokio::test]
     async fn auth_changes_allow_to_review_when_subject_id_changed() {
         let service = service().await;
+        service.db.execute_unprepared("INSERT INTO contacts(name,subject_id,class,description,status,expired_after,created_at,updated_at) VALUES('alice.example',X'01','','',2,4070995200,1,1)").await.unwrap();
         service
             .contacts
             .write()
@@ -1133,7 +1096,7 @@ mod tests {
                 Method::Specified(http::Method::GET),
                 "/profile",
                 Effect::Allow,
-                Grantee::Named,
+                Grantee::One("alice.example".into()),
             )
             .await
             .unwrap();
@@ -1291,7 +1254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_consumes_an_existing_review_decision() {
+    async fn old_review_decisions_cannot_authorize_without_an_acl_rule() {
         let service = service().await;
         service
             .set_policy(
@@ -1334,7 +1297,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, AuthResult::Allowed));
+        assert!(matches!(result, AuthResult::Reviewing(_)));
         let count = service
             .db
             .query_one_raw(Statement::from_string(
@@ -1344,6 +1307,170 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(i64::try_get(&count, "", "count").unwrap(), 0);
+        assert_eq!(i64::try_get(&count, "", "count").unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn broad_allow_is_independent_of_contact_identity_history_and_remains_revocable() {
+        let service = service().await;
+        service
+            .contacts
+            .write()
+            .await
+            .insert("alice.example".into(), SubjectId::new([1]).unwrap());
+        service
+            .set_policy(
+                Method::Specified(http::Method::GET),
+                "/std/acl/status",
+                Effect::Allow,
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        let subject = SubjectId::new([2]).unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::GET, "/std/acl/status/12"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Allowed
+        ));
+        service
+            .remove_policy(
+                Method::Specified(http::Method::GET),
+                "/std/acl/status",
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::GET, "/std/acl/status/12"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Denied
+        ));
+    }
+    #[tokio::test]
+    async fn review_approval_survives_reload_and_remains_revocable_and_identity_bound() {
+        let service = AccessService::load_from_db(
+            "sqlite::memory:",
+            "owner.example",
+            &SubjectId::new(b"owner").unwrap(),
+        )
+        .await
+        .unwrap();
+        service
+            .set_policy(
+                Method::Specified(http::Method::POST),
+                "/deploy",
+                Effect::Review,
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        let subject = SubjectId::new(b"alice").unwrap();
+        let AuthResult::Reviewing(review) = service
+            .auth(
+                headers(http::Method::POST, "/deploy"),
+                Some("alice.example"),
+                Some(&subject),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected review")
+        };
+        service
+            .decide_review(review.id(), crate::Action::Allow)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .find_contact_by_name("alice.example")
+                .await
+                .unwrap()
+                .status,
+            crate::ContactStatus::Pending as i32
+        );
+        let reloaded = AccessService::load(
+            service.db.clone(),
+            "owner.example",
+            &SubjectId::new(b"owner").unwrap(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                reloaded
+                    .auth(
+                        headers(http::Method::POST, "/deploy"),
+                        Some("alice.example"),
+                        Some(&subject)
+                    )
+                    .await
+                    .unwrap(),
+                AuthResult::Allowed
+            ));
+        }
+        assert!(matches!(
+            reloaded
+                .auth(
+                    headers(http::Method::POST, "/deploy"),
+                    Some("alice.example"),
+                    Some(&SubjectId::new(b"replacement").unwrap())
+                )
+                .await
+                .unwrap(),
+            AuthResult::Reviewing(_)
+        ));
+        assert!(matches!(
+            reloaded
+                .auth(
+                    headers(http::Method::POST, "/deploy"),
+                    Some("bob.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Reviewing(_)
+        ));
+        assert!(matches!(
+            reloaded
+                .auth(
+                    headers(http::Method::GET, "/deploy"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Denied
+        ));
+        reloaded
+            .remove_policy(
+                Method::Specified(http::Method::POST),
+                "/deploy",
+                Grantee::One("alice.example".into()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reloaded
+                .auth(
+                    headers(http::Method::POST, "/deploy"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Reviewing(_)
+        ));
     }
 }
