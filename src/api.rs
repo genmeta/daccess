@@ -20,11 +20,10 @@ pub(crate) struct ApiState {
 pub fn router(service: Arc<AccessService>) -> Router {
     Router::new()
         .route("/std/contact/list", get(contact::list))
-        .route("/std/contact/application", axum::routing::post(contact::create))
-        .route("/std/contact/status", get(contact::self_status))
         .route(
             "/std/contact",
             get(contact::get)
+                .post(contact::create)
                 .put(contact::put)
                 .patch(contact::patch)
                 .delete(contact::delete),
@@ -235,9 +234,9 @@ mod tests {
 
         let mut create = http::Request::builder()
             .method(http::Method::POST)
-            .uri("/std/contact/application")
+            .uri("/std/contact")
             .header(http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Alice","requested_access":{},"offers":{}}"#))
+            .body(axum::body::Body::from(r#"{"from":"alice.example","to":"owner.example","application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Alice","requested_access":{},"offers":{}}"#))
             .unwrap();
         create.extensions_mut().insert(crate::Visitor::new(
             "alice.example",

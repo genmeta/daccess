@@ -12,21 +12,19 @@
 | PATCH /std/contact?name=alice.smith~ | 修改别称、关系状态或有效期 |
 | DELETE /std/contact?name=alice.smith~ | 删除单个联系人及精确主体 ACL |
 | DELETE /std/contact | JSON names 非空数组，事务性批量删除 |
-| POST /std/contact/application | 远端本人提交申请；名称与 SubjectId 只来自 Visitor |
-| GET /std/contact/status[?application_id=...] | 查询调用者申请回执或当前关系和授权；必须匹配 Visitor |
+| POST /std/contact | 远端本人提交申请；from/to 表达方向，名称与 SubjectId 校验 Visitor |
+| GET /std/contact?name=NAME | 管理者读取详情；普通访问者只读取与自身真实主体绑定的最小状态和当前授权 |
 | GET /std/acl/status/{id} | 查询调用者的审批状态；记录必须属于 Visitor 的名称及 SubjectId |
 
 Pishoo 补充以下路由，同样先经统一 ACL：
 
 | 方法与路径 | 行为 |
 | --- | --- |
-| POST /std/contact | 本端新增联系人／发起申请；JSON target_name、description、requested_capabilities、offered_capabilities，可选 expires_after 或 valid_before；返回投递任务 |
-| GET /std/contact/requests[?id=...] | 读取本端申请投递进度；无 id 时分页 |
-| DELETE /std/contact/requests?id=... | 删除本端投递任务；已发送申请不会因此被远端撤销 |
-| POST /std/contact/requests/refresh?id=... | 提前安排下一次投递／状态轮询 |
+| POST /std/contact | 本端发起；JSON from、to、description、requested_capabilities、offered_capabilities，可选 expires_after 或 valid_before；202返回联系人投影 |
+| GET /std/contact?name=NAME、GET /std/contact/list | 管理查询合并后台投递状态，未验证主体的意图具有 null id/subject_id、delivery_status 和 delivery_error |
 | GET /std/contact/{name}/profile/avatar | 使用远端提供的头像；校验保存的 SubjectId，无本地覆盖或上传接口 |
 
-旧 /std/contacts、/std/contact/{name} CRUD、/std/contact/self 和 /std/contact/local/* 路由被移除。
+独立 /std/contact/application、/std/contact/status、/std/contact/requests 及刷新/删除任务入口均已移除；旧 /std/contacts、/std/contact/{name} CRUD、/std/contact/self 和 /std/contact/local/* 路由被移除。
 
 ## 联系人管理
 
@@ -55,11 +53,11 @@ PATCH 接受 status、alias、expires_after、valid_before，至少一个字段�
 
 中间件不按路径跳过判断；内部管理请求也调用 AccessService::auth。默认 deny 与 owner 基线 allow 保留。管理处理器不再次要求 owner。POST /std/contact 的申请编排如需建立联系人、写入提供给对方的能力，也验证调用者对 PUT /std/contact、对应 PATCH /std/acl/allow/{name} 的权限。
 
-规则仍按方法和路径段前缀匹配，不使用 query 区分授权范围。所有联系人管理使用同一资源权限，不增加“查自己／查别人”的管理模型。
+规则仍按方法和路径段前缀匹配，不使用 query 区分授权范围。联系人 GET 通过 GET /std/contact/list 的 ACL 判断是否具有目录管理权；没有目录权限时只允许查询自己的名称且必须匹配已保存的 SubjectId，返回最小关系状态及当前授权。
 
 Named／All 授权面向已验证具名身份或所有访问者，不依赖历史联系人记录的 SubjectId；其 allow 不会因历史主体变更再生成审批。One／Group 等针对身份的 allow 仍在同名 SubjectId 变化时转审批。回执处理器在 ACL 之后继续核对记录归属，不能读取其他身份的记录。
 
-daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/contact/status allow **、GET /std/acl/status allow **、POST /std/contact/application allow **，以及公开 Profile／Workspace／能力发现规则。所有规则允许修改、拒绝、删除，重启不补回；POST /std/contact 管理不向普通具名访客默认开放。
+daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/contact allow **、GET /std/acl/status allow **、POST /std/contact allow **，并显式设置 GET /std/contact/list deny *? 以阻断父路径继承，以及公开 Profile／Workspace／能力发现规则。所有规则允许修改、拒绝、删除，重启不补回；本端发起仍核对 PUT /std/contact 和所选授权写入权限，不能伪造 from 绕过管理授权。
 
 其他 ACL 查询、写入、审批、管理员保护及策略优先级沿用上游 0.1.1；见 UPSTREAM_SPEC.md 的相应算法说明，旧路径和旧 SubjectId 广泛 allow 行为以本文为准。
 
@@ -68,7 +66,7 @@ daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/con
 调用者直接请求业务接口，由接收方统一 ACL 判断，不先申请能力或探测对方权限。合法请求头 `If-Reviewed` 仅允许单个 `waiting` 或 `break`，缺省为 `break`；非法值或重复头返回 400。ACL allow 正常执行，deny 返回 403；匿名 review 拒绝且不建待办。
 
 - `review + waiting`：只登记内存实时待办并等待原请求；批准后继续执行原业务，拒绝返回 403。请求 Future 取消、适配器超时或进程退出时清理，不将待办落库。适配器须设置有界等待；Pishoo 上限 300 秒。
-- `review + break`：保存异步待办，返回 `400 Bad Request`、`Cache-Control: no-store` 和 `{"error":"need_review","review_id":12,"status_url":"/std/acl/status/12"}`。默认待办期限 1 天。调用者稍后重试原业务；可选查询状态，不必先访问 `/std/contact/status`。
+- `review + break`：保存异步待办，返回 `400 Bad Request`、`Cache-Control: no-store` 和 `{"error":"need_review","review_id":12,"status_url":"/std/acl/status/12"}`。默认待办期限 1 天。调用者稍后重试原业务；可选查询状态，不必先访问联系人状态。
 
 异步去重键由服务端计算：`SHA256("dhttp/request-id/1" + NUL + LP(method) + LP(normalized_path) + LP(visitor) + LP(subject_id))`，LP 为 8 字节大端长度及原始字节。路径去除 query 并沿用 ACL 规范化；普通请求头、query、正文不参与去重。外部 Request-Id 不控制审核。
 

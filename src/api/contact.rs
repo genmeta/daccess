@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AccessService, ContactStatus, Effect, Grantee, Method, SubjectId,
+    AccessService, ContactStatus, Effect, Grantee, Method, SubjectId, Visitor,
     pagination::{Page, PageQuery, order_sql},
     policy::database_api,
 };
@@ -94,6 +94,9 @@ pub struct ContactRecord {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NewContactBody {
+    #[serde(rename = "from")]
+    from_name: String,
+    to: String,
     application_id: String,
     #[serde(default)]
     class: String,
@@ -102,12 +105,6 @@ pub(crate) struct NewContactBody {
     requested_access: RequestedAccess,
     #[serde(default)]
     offers: GrantedAccess,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ApplicationQuery {
-    application_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -163,6 +160,7 @@ pub(crate) struct ContactBody {
 
 #[derive(Serialize)]
 pub(crate) struct SelfContactStatusBody {
+    valid_before: i64,
     id: i64,
     name: String,
     subject_id: String,
@@ -373,17 +371,6 @@ impl AccessService {
         ))
     }
 
-    async fn find_application(&self, application_id: &str) -> Result<ApplicationRecord, DbErr> {
-        expire_pending_contacts(&self.db, None).await?;
-        let row = self.db.query_one_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT application_id, applicant_name, applicant_sid, payload_hash, status, received_at, expired_after \
-             FROM contact_applications WHERE application_id = ?",
-            [application_id.into()],
-        )).await?.ok_or_else(|| DbErr::RecordNotFound(format!("application {application_id:?}")))?;
-        decode_application(row)
-    }
-
     pub async fn find_contact_by_name(&self, name: &str) -> Result<ContactRecord, DbErr> {
         expire_pending_contacts(&self.db, Some(name)).await?;
         let row = self
@@ -540,15 +527,11 @@ impl AccessService {
                                 &transaction,
                                 name,
                                 &method,
-                                "/std/contact/application",
+                                "/std/contact",
                                 Effect::Deny,
                             )
                             .await?;
-                            added_rules.push((
-                                method,
-                                String::from("/std/contact/application"),
-                                Effect::Deny,
-                            ));
+                            added_rules.push((method, String::from("/std/contact"), Effect::Deny));
                         }
                         transaction
                             .execute_raw(Statement::from_sql_and_values(
@@ -1016,6 +999,15 @@ pub(crate) async fn create(
     let visitor = visitor
         .as_ref()
         .ok_or_else(|| crate::api::bad_request("verified visitor identity is required"))?;
+    if normalized_name(&body.from_name)? != visitor.name() {
+        return Err((
+            http::StatusCode::FORBIDDEN,
+            "from does not match the verified caller".into(),
+        ));
+    }
+    if normalized_name(&body.to)? != state.service.owner_name {
+        return Err(crate::api::bad_request("to does not match this identity"));
+    }
     validate_application_id(&body.application_id)?;
     if visitor.name() == state.service.owner_name.as_str() {
         return Err(crate::api::bad_request(
@@ -1147,9 +1139,36 @@ pub(crate) async fn list(
 
 pub(crate) async fn get(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
+    visitor: Option<axum::Extension<Visitor>>,
     axum::extract::Query(query): axum::extract::Query<ContactQuery>,
-) -> Result<axum::Json<ContactBody>, crate::api::ApiError> {
+) -> Result<axum::Json<serde_json::Value>, crate::api::ApiError> {
     let name = query.required_name()?;
+    let visitor = visitor.ok_or((
+        http::StatusCode::FORBIDDEN,
+        "verified visitor identity is required".into(),
+    ))?;
+    let manager = matches!(
+        state
+            .service
+            .auth(
+                crate::Headers {
+                    method: http::Method::GET,
+                    path: "/std/contact/list".into(),
+                    fields: http::HeaderMap::new(),
+                },
+                Some(visitor.name()),
+                Some(visitor.subject_id())
+            )
+            .await
+            .map_err(crate::api::database)?,
+        crate::AuthResult::Allowed
+    );
+    if !manager && name != visitor.name() {
+        return Err((
+            http::StatusCode::FORBIDDEN,
+            "only your own contact state may be read".into(),
+        ));
+    }
     let contact = state
         .service
         .find_contact_by_name(&name)
@@ -1158,7 +1177,37 @@ pub(crate) async fn get(
     let id = contact_id(&state.service, &name, &contact.subject_id)
         .await
         .map_err(crate::api::database)?;
-    Ok(axum::Json(contact_body(contact, id, None)))
+    if manager {
+        return Ok(axum::Json(
+            serde_json::to_value(contact_body(contact, id, None)).map_err(crate::api::internal)?,
+        ));
+    }
+    if &contact.subject_id != visitor.subject_id() {
+        return Err((
+            http::StatusCode::FORBIDDEN,
+            "contact subject no longer matches verified caller".into(),
+        ));
+    }
+    let status = ContactStatus::try_from(contact.status)
+        .map_err(|_| crate::api::internal("invalid contact status"))?;
+    let granted_access = if status == ContactStatus::Active {
+        collect_granted_access(&state.service.db, &name)
+            .await
+            .map_err(crate::api::database)?
+    } else {
+        GrantedAccess::new()
+    };
+    Ok(axum::Json(
+        serde_json::to_value(SelfContactStatusBody {
+            id,
+            name,
+            subject_id: String::from_utf8_lossy(visitor.subject_id().as_bytes()).into_owned(),
+            status,
+            valid_before: contact.expired_after,
+            granted_access,
+        })
+        .map_err(crate::api::internal)?,
+    ))
 }
 
 struct Expiry {
@@ -1326,68 +1375,6 @@ async fn contact_id(
     row.try_get("", "id")
 }
 
-pub(crate) async fn self_status(
-    axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-    visitor: Option<axum::Extension<crate::Visitor>>,
-    axum::extract::Query(query): axum::extract::Query<ApplicationQuery>,
-) -> Result<axum::Json<serde_json::Value>, crate::api::ApiError> {
-    let visitor = visitor
-        .as_ref()
-        .ok_or_else(|| crate::api::bad_request("verified visitor identity is required"))?;
-    if let Some(application_id) = query.application_id {
-        validate_application_id(&application_id)?;
-        let record = state
-            .service
-            .find_application(&application_id)
-            .await
-            .map_err(crate::api::database)?;
-        if record.applicant_name != visitor.name()
-            || record.applicant_sid.as_slice() != visitor.subject_id().as_bytes()
-        {
-            return Err((
-                http::StatusCode::FORBIDDEN,
-                String::from("application does not belong to the verified visitor"),
-            ));
-        }
-        let response = application_response(&state.service, record).await?;
-        return Ok(axum::Json(serde_json::to_value(response).map_err(
-            |_| crate::api::internal("failed to encode application"),
-        )?));
-    }
-    let contact = state
-        .service
-        .find_contact_by_name(visitor.name())
-        .await
-        .map_err(crate::api::database)?;
-    if &contact.subject_id != visitor.subject_id() {
-        return Err((
-            http::StatusCode::FORBIDDEN,
-            String::from("contact subject_id no longer matches the verified visitor"),
-        ));
-    }
-    let status = ContactStatus::try_from(contact.status)
-        .map_err(|_| crate::api::internal("contact has an invalid status"))?;
-    let granted_access = if status == ContactStatus::Active {
-        collect_granted_access(&state.service.db, visitor.name())
-            .await
-            .map_err(crate::api::database)?
-    } else {
-        GrantedAccess::new()
-    };
-    Ok(axum::Json(
-        serde_json::to_value(SelfContactStatusBody {
-            id: contact_id(&state.service, visitor.name(), visitor.subject_id())
-                .await
-                .map_err(crate::api::database)?,
-            name: visitor.name().to_owned(),
-            subject_id: String::from_utf8_lossy(visitor.subject_id().as_bytes()).into_owned(),
-            status,
-            granted_access,
-        })
-        .map_err(|_| crate::api::internal("failed to encode contact status"))?,
-    ))
-}
-
 pub(crate) async fn patch(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
     axum::extract::Query(query): axum::extract::Query<ContactQuery>,
@@ -1531,6 +1518,10 @@ mod tests {
             String::from("owner.example"),
             SubjectId::new(b"owner-subject".to_vec()).unwrap(),
         );
+        *service.policies.write().await =
+            AccessService::policies_from_db(&service.db, "owner.example")
+                .await
+                .unwrap();
         service
     }
 
@@ -1539,12 +1530,20 @@ mod tests {
         uri: &str,
         body: &'static str,
     ) -> http::Request<axum::body::Body> {
-        http::Request::builder()
+        let reading = method == http::Method::GET && uri.starts_with("/std/contact?");
+        let mut request = http::Request::builder()
             .method(method)
             .uri(uri)
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(body))
-            .unwrap()
+            .unwrap();
+        if reading {
+            request.extensions_mut().insert(crate::Visitor::new(
+                "owner.example",
+                SubjectId::new(b"owner-subject").unwrap(),
+            ));
+        }
+        request
     }
 
     fn as_visitor(
@@ -1717,7 +1716,7 @@ mod tests {
                 .await
                 .evaluate(
                     &http::Method::PATCH,
-                    "/std/contact/application",
+                    "/std/contact",
                     &[Grantee::One("alice.example".into())]
                 )
                 .0,
@@ -1745,7 +1744,7 @@ mod tests {
                 .await
                 .evaluate(
                     &http::Method::PATCH,
-                    "/std/contact/application",
+                    "/std/contact",
                     &[Grantee::One("alice.example".into())]
                 )
                 .0,
@@ -1961,13 +1960,14 @@ mod tests {
             .unwrap();
         let app = crate::api::router(service);
 
-        let anonymous = request(http::Method::GET, "/std/contact/status", "");
+        let mut anonymous = request(http::Method::GET, "/std/contact?name=alice.example", "");
+        anonymous.extensions_mut().remove::<crate::Visitor>();
         assert_eq!(
             app.clone().oneshot(anonymous).await.unwrap().status(),
-            http::StatusCode::BAD_REQUEST
+            http::StatusCode::FORBIDDEN
         );
 
-        let mut self_request = request(http::Method::GET, "/std/contact/status", "");
+        let mut self_request = request(http::Method::GET, "/std/contact?name=alice.example", "");
         self_request.extensions_mut().insert(crate::Visitor::new(
             "alice.example",
             SubjectId::new(vec![1]).unwrap(),
@@ -1984,7 +1984,7 @@ mod tests {
         );
 
         let mismatch = as_visitor(
-            request(http::Method::GET, "/std/contact/status", ""),
+            request(http::Method::GET, "/std/contact?name=alice.example", ""),
             "alice.example",
         );
         assert_eq!(
@@ -1993,7 +1993,7 @@ mod tests {
         );
 
         let missing = as_visitor(
-            request(http::Method::GET, "/std/contact/status", ""),
+            request(http::Method::GET, "/std/contact?name=mallory.example", ""),
             "mallory.example",
         );
         assert_eq!(
@@ -2016,7 +2016,7 @@ mod tests {
                 .await
                 .unwrap();
             let app = crate::api::router(Arc::new(service));
-            let mut request = request(http::Method::GET, "/std/contact/status", "");
+            let mut request = request(http::Method::GET, "/std/contact?name=alice.example", "");
             request.extensions_mut().insert(crate::Visitor::new(
                 "alice.example",
                 SubjectId::new(vec![1]).unwrap(),
@@ -2111,7 +2111,7 @@ mod tests {
             .await
             .unwrap();
         let app = crate::api::router(Arc::new(service));
-        let mut request = request(http::Method::GET, "/std/contact/status", "");
+        let mut request = request(http::Method::GET, "/std/contact?name=alice.example", "");
         request.extensions_mut().insert(crate::Visitor::new(
             "alice.example",
             SubjectId::new(vec![1]).unwrap(),
@@ -2205,8 +2205,8 @@ mod tests {
         let owner = as_visitor(
             request(
                 http::Method::POST,
-                "/std/contact/application",
-                r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Owner"}"#,
+                "/std/contact",
+                r#"{"from":"owner.example","to":"owner.example","application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Owner"}"#,
             ),
             "owner.example",
         );
@@ -2217,8 +2217,8 @@ mod tests {
         let create = as_visitor(
             request(
                 http::Method::POST,
-                "/std/contact/application",
-                r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","class":"agent","description":"Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
+                "/std/contact",
+                r#"{"from":"alice.example","to":"owner.example","application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","class":"agent","description":"Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
             ),
             "alice.example",
         );
@@ -2229,8 +2229,8 @@ mod tests {
         let retry = as_visitor(
             request(
                 http::Method::POST,
-                "/std/contact/application",
-                r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","class":"agent","description":"Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
+                "/std/contact",
+                r#"{"from":"alice.example","to":"owner.example","application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","class":"agent","description":"Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
             ),
             "alice.example",
         );
@@ -2239,11 +2239,7 @@ mod tests {
             http::StatusCode::OK
         );
         let status = as_visitor(
-            request(
-                http::Method::GET,
-                "/std/contact/status?application_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "",
-            ),
+            request(http::Method::GET, "/std/contact?name=alice.example", ""),
             "alice.example",
         );
         let status = app.clone().oneshot(status).await.unwrap();
@@ -2251,13 +2247,13 @@ mod tests {
         let status: serde_json::Value =
             serde_json::from_slice(&status.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
-        assert_eq!(status["name"], "owner.example");
+        assert_eq!(status["name"], "alice.example");
         assert_eq!(status["status"], "pending");
         let duplicate = as_visitor(
             request(
                 http::Method::POST,
-                "/std/contact/application",
-                r#"{"application_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","class":"service","description":"Updated Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
+                "/std/contact",
+                r#"{"from":"alice.example","to":"owner.example","application_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","class":"service","description":"Updated Alice","requested_access":{"/api/messages":["POST"]},"offers":{}}"#,
             ),
             "alice.example",
         );
@@ -2374,11 +2370,33 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                service.find_application(&first_id).await.unwrap().status,
+                service
+                    .db
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Sqlite,
+                        "SELECT status FROM contact_applications WHERE application_id=?",
+                        [first_id.into()]
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get::<String>("", "status")
+                    .unwrap(),
                 "revoked"
             );
             assert_eq!(
-                service.find_application(&next_id).await.unwrap().status,
+                service
+                    .db
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Sqlite,
+                        "SELECT status FROM contact_applications WHERE application_id=?",
+                        [next_id.into()]
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get::<String>("", "status")
+                    .unwrap(),
                 "active"
             );
         }
@@ -2434,7 +2452,18 @@ mod tests {
                 service.find_contact_by_name("alice.example").await.unwrap(),
                 before
             );
-            assert!(service.find_application(&next_id).await.is_err());
+            assert!(
+                service
+                    .db
+                    .query_one_raw(Statement::from_sql_and_values(
+                        DatabaseBackend::Sqlite,
+                        "SELECT 1 FROM contact_applications WHERE application_id=?",
+                        [next_id.into()]
+                    ))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 

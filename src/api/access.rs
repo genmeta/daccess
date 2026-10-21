@@ -1025,7 +1025,7 @@ mod tests {
         );
         let delete_business_administrator = http::Request::builder()
             .method(http::Method::DELETE)
-            .uri("/std/contact/bob.example")
+            .uri("/std/contact?name=bob.example")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(
@@ -1103,7 +1103,7 @@ mod tests {
         );
         let delete_contact = http::Request::builder()
             .method(http::Method::DELETE)
-            .uri("/std/contact/alice.example")
+            .uri("/std/contact?name=alice.example")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(

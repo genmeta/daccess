@@ -21,7 +21,7 @@
 
 完整的数据模型、状态机和 HTTP API 定义见 [SPEC.md](SPEC.md)。
 
-`feat/contact-acl-v2` 分支包含尚未发布的统一联系人 API 与 schema v2；已发布 `0.1.1` 的历史协议保存在 [UPSTREAM_SPEC.md](UPSTREAM_SPEC.md)。Pishoo 通过 Git 分支依赖接入这些变更。
+`feat/contact-acl-v2` 分支包含尚未发布的统一联系人 API 与 schema v2；已发布 `0.1.1` 的历史协议保存在 [UPSTREAM_SPEC.md](UPSTREAM_SPEC.md)。Pishoo 固定使用本分支的具体 Git 提交；共享开发时可临时使用同级本地 path 依赖同步修改和验证。
 
 ## 接入步骤
 
