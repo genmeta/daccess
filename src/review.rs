@@ -87,7 +87,7 @@ impl From<PendingReview> for PendingReviewResponse {
         Self {
             error: "need_review",
             review_id,
-            status_url: format!("/std/acl/status/{review_id}"),
+            status_url: format!("/std/acl/status?id={review_id}"),
         }
     }
 }
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             serde_json::json!({
-                "error": "need_review", "review_id": 12, "status_url": "/std/acl/status/12",
+                "error": "need_review", "review_id": 12, "status_url": "/std/acl/status?id=12",
             })
         );
     }

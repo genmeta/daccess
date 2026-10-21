@@ -134,22 +134,22 @@ let application = application.layer(your_access_control_middleware(acl.clone()))
 主要端点包括：
 
 - `/std/contact`、`/std/contact/list`：联系人管理，单条资源通过 `?name=...` 指定；
-- `/std/contact/application`、`/std/contact/status`：远端本人提交申请和查询回执；
+- `POST /std/contact`、`GET /std/contact?name=NAME`：远端本人提交申请和查询关系状态；
 - `/std/acl/apis`、`/std/acl/access`、`/std/acl/allow`：权限规则管理；
-- `/std/acl/review`、`/std/acl/reviews`：审批管理；`/std/acl/status/{id}`：发起方状态查询。
+- `/std/acl/review`、`/std/acl/review/list`：审批管理；`/std/acl/status?id={id}`：发起方状态查询。
 
 具体 method、请求体和响应体见 [SPEC.md](SPEC.md)。管理请求由统一 ACL 授权，处理器不再额外要求所有者身份。
 
 ### 5. 联系人状态拉取
 
-本地管理员批准联系人只写入本 profile 的状态并立即返回；pishoo 不会向对端建立
-连接、维护重试或判断对方是否在线。发送方 pishoo 将申请保存到本地队列并重试投递；
+本地管理员批准联系人只写入本 profile 的状态并立即返回；daccess 本身不主动向对端
+推送审批结果。发送方 pishoo 将申请保存到本地队列并重试投递；
 接收方以实际收到时间设定 7 天有效期。申请方以后通过已认证的 DHTTP 请求调用
-`GET /std/contact/status?application_id=...` 拉取该申请状态和当前精确授权。
+`GET /std/contact?name=NAME`，其中 NAME 是申请者自己的真实名称，拉取关系状态和当前精确授权。
 
-该端点不接受联系人名称参数。承载应用必须先从 mTLS/DHTTP 连接构造 `Visitor`，
-再执行统一 ACL；handler 会用该 Visitor 的 name 和 SubjectId 校验
-申请编号归属。因此它不能被用于枚举其他联系人的申请，也不会暴露管理端详情。
+承载应用先从 mTLS/DHTTP 连接构造 `Visitor`，再执行统一 ACL。没有联系人目录管理权限时，
+handler 仅允许查询该 Visitor 自己的 name，并校验已保存的 SubjectId，
+返回最小关系状态及当前授权，不暴露其他联系人或管理端详情。
 
 ## 直接管理规则
 
@@ -185,9 +185,11 @@ pishoo 负责 profile 生命周期，为每个 profile 创建独立的 `AccessSe
 数据库，在 DHTTP/mTLS 验证完成后构造 `Visitor`，并在同一个 Axum 进程中组合管理
 Router、业务 Router 和访问控制中间件。
 
-pishoo 在自身仓库维护 Workspace 前端，提供审批、联系人和访问规则页面，通过
-同进程的 daccess Router 调用 `/std/acl/*`、`/std/contact` 和 `/std/contact/*`。
-`/workspace-api/context` 由 pishoo 提供当前 profile 的运行时上下文。
+独立的 [Workspace 仓库](https://github.com/genmeta/workspace) 提供审批、联系人和访问规则页面，
+构建为由 pishoo 安装和托管的 App，通过同源 `/std/acl/*`、`/std/contact` 和
+`/std/contact/list` 调用原生接口；昵称和头像由独立的 Profile Lib 提供。
 
-Workspace 的前端开发、静态资源构建和浏览器 E2E 均在 pishoo 仓库进行；
+Workspace 的前端开发、静态资源构建和浏览器 E2E 在其独立仓库进行；
 daccess 负责 Rust 库、协议文档、测试和当前数据库结构。
+
+管理对象使用 query：`/std/acl/access?api=/std/message`、`/std/acl/allow?name=NAME`、`DELETE /std/acl/review?id=ID`。联系人不再提供 HTTP PUT；本端 POST 编排由宿主验证真实所有者后调用内部落库方法。

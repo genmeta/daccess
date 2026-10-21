@@ -286,11 +286,45 @@ pub(crate) async fn list_persistent(
     Ok(axum::Json(Page::new(items, total, pagination)))
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ReviewQuery {
+    id: i64,
+}
+
+impl ReviewQuery {
+    fn positive_id(self) -> Result<i64, crate::api::ApiError> {
+        if self.id <= 0 {
+            return Err(crate::api::bad_request("id must be positive"));
+        }
+        Ok(self.id)
+    }
+}
+
+pub(crate) async fn delete(
+    axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
+    axum::extract::Query(query): axum::extract::Query<ReviewQuery>,
+) -> Result<http::StatusCode, crate::api::ApiError> {
+    let id = query.positive_id()?;
+    let result = state.service.database().execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "DELETE FROM access_reviews WHERE id=? AND stage=0 AND expired_after<=CAST(strftime('%s','now') AS INTEGER)",
+        [id.into()],
+    )).await.map_err(crate::api::database)?;
+    if result.rows_affected() == 0 {
+        return Err((
+            http::StatusCode::NOT_FOUND,
+            "expired pending review not found".into(),
+        ));
+    }
+    Ok(http::StatusCode::NO_CONTENT)
+}
+
 pub(crate) async fn status(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-    axum::extract::Path(id): axum::extract::Path<i64>,
+    axum::extract::Query(query): axum::extract::Query<ReviewQuery>,
     visitor: Option<axum::Extension<Visitor>>,
 ) -> Result<axum::Json<ReviewStatusBody>, crate::api::ApiError> {
+    let id = query.positive_id()?;
     let visitor = visitor.ok_or((
         http::StatusCode::FORBIDDEN,
         String::from("review status requires an authenticated visitor"),
@@ -379,14 +413,14 @@ mod tests {
         service.db.execute_unprepared("INSERT INTO access_reviews (request_id, visitor, visitor_sid, method, api, stage, reason, expired_after, updated_at, created_at) VALUES ('r1', 'alice.example', X'01', 'GET', '/api', 1, 'review', 4070995200, 4070908800, 4070908800)").await.unwrap();
         let app = crate::api::router(service.clone());
         let request = http::Request::builder()
-            .uri("/std/acl/status/1")
+            .uri("/std/acl/status?id=1")
             .body(axum::body::Body::empty())
             .unwrap();
         let denied = app.clone().oneshot(request).await.unwrap();
         assert_eq!(denied.status(), http::StatusCode::FORBIDDEN);
 
         let mut request = http::Request::builder()
-            .uri("/std/acl/status/1")
+            .uri("/std/acl/status?id=1")
             .body(axum::body::Body::empty())
             .unwrap();
         request
@@ -424,7 +458,7 @@ mod expiry_tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/std/acl/reviews?status=expired")
+                    .uri("/std/acl/review/list?status=expired")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -443,7 +477,7 @@ mod expiry_tests {
                     .oneshot(
                         http::Request::builder()
                             .method("DELETE")
-                            .uri(format!("/std/acl/review/{id}"))
+                            .uri(format!("/std/acl/review?id={id}"))
                             .body(Body::empty())
                             .unwrap()
                     )
@@ -456,7 +490,7 @@ mod expiry_tests {
         assert_eq!(
             app.oneshot(
                 http::Request::builder()
-                    .uri("/std/acl/reviews?status=other")
+                    .uri("/std/acl/review/list?status=other")
                     .body(Body::empty())
                     .unwrap()
             )

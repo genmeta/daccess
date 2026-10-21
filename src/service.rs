@@ -455,6 +455,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_post_rules_and_approvals_never_authorize_message_put() {
+        let service = AccessService::load_from_db(
+            "sqlite::memory:",
+            "owner.example",
+            &SubjectId::new(b"owner").unwrap(),
+        )
+        .await
+        .unwrap();
+        let subject = SubjectId::new(b"alice").unwrap();
+        service
+            .set_policy(
+                Method::Specified(http::Method::POST),
+                "/std/message",
+                Effect::Allow,
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::POST, "/std/message"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Allowed
+        ));
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::PUT, "/std/message"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Denied
+        ));
+        service.db.execute_unprepared("INSERT INTO access_reviews(request_id,visitor,visitor_sid,method,api,stage,reason,expired_after,updated_at,created_at) VALUES('old-post','alice.example',X'616c696365','POST','/std/message',0,'old request',4070995200,1,1)").await.unwrap();
+        service
+            .decide_review(1, crate::Action::Allow)
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::PUT, "/std/message"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Denied
+        ));
+        service
+            .set_policy(
+                Method::Specified(http::Method::PUT),
+                "/std/message",
+                Effect::Review,
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::PUT, "/std/message"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Reviewing(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn version_zero_migration_creates_and_constrains_the_schema() {
         let service = service().await;
         let tables = service
@@ -1330,7 +1409,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/std/acl/status/12"),
+                    headers(http::Method::GET, "/std/acl/status?id=12"),
                     Some("alice.example"),
                     Some(&subject)
                 )
@@ -1349,7 +1428,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/std/acl/status/12"),
+                    headers(http::Method::GET, "/std/acl/status?id=12"),
                     Some("alice.example"),
                     Some(&subject)
                 )
