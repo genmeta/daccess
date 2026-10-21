@@ -378,67 +378,102 @@ pub(crate) async fn list_apis(
     Ok(axum::Json(Page::new(items, total, pagination)))
 }
 
-pub(crate) async fn list_all_rules_by_api(
-    axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-) -> Result<axum::Json<RulesByApiTree>, crate::api::ApiError> {
-    Ok(axum::Json(
-        state
-            .service
-            .list_all_rules_by_api()
-            .await
-            .map_err(crate::api::database)?,
-    ))
+#[derive(Deserialize)]
+pub(crate) struct ApiQuery {
+    api: Option<String>,
 }
 
-pub(crate) async fn list_all_rules_by_name(
-    axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-) -> Result<axum::Json<RulesByNameTree>, crate::api::ApiError> {
-    Ok(axum::Json(
-        state
-            .service
-            .list_all_rules_by_name()
-            .await
-            .map_err(crate::api::database)?,
-    ))
+impl ApiQuery {
+    fn validated(self) -> Result<Option<String>, crate::api::ApiError> {
+        if self.api.as_ref().is_some_and(|api| !api.starts_with('/')) {
+            return Err(crate::api::bad_request("api must start with /"));
+        }
+        Ok(self.api)
+    }
+    fn required(self) -> Result<String, crate::api::ApiError> {
+        self.validated()?
+            .ok_or_else(|| crate::api::bad_request("api is required"))
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NameQuery {
+    name: Option<String>,
+}
+
+impl NameQuery {
+    fn validated(self) -> Result<Option<String>, crate::api::ApiError> {
+        if let Some(name) = &self.name {
+            name.parse::<Grantee>().map_err(crate::api::bad_request)?;
+        }
+        Ok(self.name)
+    }
+    fn required(self) -> Result<String, crate::api::ApiError> {
+        self.validated()?
+            .ok_or_else(|| crate::api::bad_request("name is required"))
+    }
 }
 
 pub(crate) async fn list_rules_by_name(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Query(target): axum::extract::Query<NameQuery>,
     axum::extract::Query(query): axum::extract::Query<PageQuery<Sort>>,
-) -> Result<axum::Json<Page<RulesByApiTree>>, crate::api::ApiError> {
-    let pagination = query.pagination();
-    let (offset, limit) = pagination.offset_limit()?;
-    let (total, items) = state
-        .service
-        .list_rules_by_name(&name, offset, limit, query.sort, query.order)
-        .await
-        .map_err(crate::api::database)?;
-    Ok(axum::Json(Page::new(items, total, pagination)))
+) -> Result<axum::Json<serde_json::Value>, crate::api::ApiError> {
+    let value = match target.validated()? {
+        None => serde_json::to_value(
+            state
+                .service
+                .list_all_rules_by_name()
+                .await
+                .map_err(crate::api::database)?,
+        ),
+        Some(name) => {
+            let pagination = query.pagination();
+            let (offset, limit) = pagination.offset_limit()?;
+            let (total, items) = state
+                .service
+                .list_rules_by_name(&name, offset, limit, query.sort, query.order)
+                .await
+                .map_err(crate::api::database)?;
+            serde_json::to_value(Page::new(items, total, pagination))
+        }
+    }
+    .map_err(crate::api::internal)?;
+    Ok(axum::Json(value))
 }
 
 pub(crate) async fn list_rules_by_api(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-    axum::extract::Path(api): axum::extract::Path<String>,
-) -> Result<axum::Json<RulesByMethod>, crate::api::ApiError> {
-    let api = api_from_path(api);
-    Ok(axum::Json(
-        state
-            .service
-            .list_rules_by_api(&api)
-            .await
-            .map_err(crate::api::database)?,
-    ))
+    axum::extract::Query(target): axum::extract::Query<ApiQuery>,
+) -> Result<axum::Json<serde_json::Value>, crate::api::ApiError> {
+    let value = match target.validated()? {
+        None => serde_json::to_value(
+            state
+                .service
+                .list_all_rules_by_api()
+                .await
+                .map_err(crate::api::database)?,
+        ),
+        Some(api) => serde_json::to_value(
+            state
+                .service
+                .list_rules_by_api(&api)
+                .await
+                .map_err(crate::api::database)?,
+        ),
+    }
+    .map_err(crate::api::internal)?;
+    Ok(axum::Json(value))
 }
 
 pub(crate) async fn set_by_api(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-    axum::extract::Path(api): axum::extract::Path<String>,
+    axum::extract::Query(target): axum::extract::Query<ApiQuery>,
     axum::Json(body): axum::Json<AccessRuleBody>,
 ) -> Result<http::StatusCode, crate::api::ApiError> {
     set_rule(
         &state,
-        &api_from_path(api),
+        &target.required()?,
         body.method,
         body.effect,
         body.grantee,
@@ -448,10 +483,17 @@ pub(crate) async fn set_by_api(
 
 pub(crate) async fn set_by_name(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Query(target): axum::extract::Query<NameQuery>,
     axum::Json(body): axum::Json<AccessRuleByNameBody>,
 ) -> Result<http::StatusCode, crate::api::ApiError> {
-    set_rule(&state, &body.api, body.method, body.effect, name).await
+    set_rule(
+        &state,
+        &body.api,
+        body.method,
+        body.effect,
+        target.required()?,
+    )
+    .await
 }
 
 async fn set_rule(
@@ -474,10 +516,10 @@ async fn set_rule(
 
 pub(crate) async fn delete_by_name(
     axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Query(target): axum::extract::Query<NameQuery>,
     axum::Json(body): axum::Json<DeleteRuleByNameBody>,
 ) -> Result<http::StatusCode, crate::api::ApiError> {
-    delete_rule(&state, &body.api, body.method, name).await
+    delete_rule(&state, &body.api, body.method, target.required()?).await
 }
 
 async fn delete_rule(
@@ -494,10 +536,6 @@ async fn delete_rule(
         .await
         .map_err(crate::api::database)?;
     Ok(http::StatusCode::NO_CONTENT)
-}
-
-fn api_from_path(api: String) -> String {
-    format!("/{}", api.trim_start_matches('/'))
 }
 
 #[cfg(test)]
@@ -727,7 +765,7 @@ mod tests {
         let response = app
             .oneshot(
                 http::Request::builder()
-                    .uri("/std/acl/access/newer")
+                    .uri("/std/acl/access?api=/newer")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -824,7 +862,7 @@ mod tests {
         let response = app
             .oneshot(
                 http::Request::builder()
-                    .uri("/std/acl/access/api/2")
+                    .uri("/std/acl/access?api=/api/2")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -931,7 +969,7 @@ mod tests {
         let response = crate::api::router(service)
             .oneshot(
                 http::Request::builder()
-                    .uri("/std/acl/allow/alice.smith~?page=1&page_size=1")
+                    .uri("/std/acl/allow?name=alice.smith~&page=1&page_size=1")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -980,12 +1018,12 @@ mod tests {
         let rule = |method: http::Method, api: &str, effect: &str, grantee: &str| {
             let (uri, body) = if method == http::Method::POST {
                 (
-                    format!("/std/acl/access/{}", api.trim_start_matches('/')),
+                    format!("/std/acl/access?api={api}"),
                     format!(r#"{{"method":"GET","effect":"{effect}","grantee":"{grantee}"}}"#),
                 )
             } else {
                 (
-                    format!("/std/acl/allow/{grantee}"),
+                    format!("/std/acl/allow?name={grantee}"),
                     format!(r#"{{"method":"GET","api":"{api}","effect":"{effect}"}}"#),
                 )
             };
@@ -1078,7 +1116,7 @@ mod tests {
 
         let delete = http::Request::builder()
             .method(http::Method::DELETE)
-            .uri("/std/acl/allow/alice.example")
+            .uri("/std/acl/allow?name=alice.example")
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(
                 r#"{"method":"GET","api":"/std/acl"}"#,
@@ -1140,7 +1178,7 @@ mod tests {
 
         let delete_group = http::Request::builder()
             .method(http::Method::DELETE)
-            .uri("/std/acl/allow/admin@example")
+            .uri("/std/acl/allow?name=admin%40example")
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(
                 r#"{"method":"GET","api":"/std/acl"}"#,

@@ -1,3 +1,5 @@
+> 本文保留上游历史方案。当前接口与安全边界以 [SPEC.md](SPEC.md) 为准；旧路径和联系人 PUT 不代表当前可执行接口。
+
 # Access Control 数据模型与管理协议
 
 > 本文归档已发布 `daccess 0.1.1` 的协议。`feat/contact-acl-v2` 分支的路由、迁移与审批行为以 [SPEC.md](SPEC.md) 为准。

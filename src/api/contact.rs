@@ -1239,116 +1239,67 @@ impl Expiry {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManagedContactBody {
-    subject_id: String,
-    #[serde(default)]
-    class: String,
-    #[serde(default)]
-    description: String,
-    alias: Option<String>,
-    #[serde(default = "pending_status")]
-    status: ContactStatus,
-    #[serde(default)]
-    requested_access: RequestedAccess,
-    #[serde(default)]
-    offers: GrantedAccess,
-    expires_after: Option<i64>,
-    valid_before: Option<i64>,
-}
-fn pending_status() -> ContactStatus {
-    ContactStatus::Pending
-}
-
-pub(crate) async fn put(
-    axum::extract::State(state): axum::extract::State<crate::api::ApiState>,
-    axum::extract::Query(query): axum::extract::Query<ContactQuery>,
-    axum::Json(body): axum::Json<ManagedContactBody>,
-) -> Result<http::StatusCode, crate::api::ApiError> {
-    let name = query.required_name()?;
-    if name == state.service.owner_name
-        || !matches!(body.status, ContactStatus::Pending | ContactStatus::Active)
-    {
-        return Err(crate::api::bad_request("invalid contact name or status"));
-    }
-    let subject_id = SubjectId::new(body.subject_id.as_bytes())
-        .map_err(|_| crate::api::bad_request("invalid subject_id"))?;
-    validate_description_length(&body.description).map_err(crate::api::database)?;
-    let alias = body.alias.as_deref().unwrap_or("").trim();
-    validate_alias(alias)?;
-    let requests = encode_requested_access(&body.requested_access).map_err(crate::api::database)?;
-    let offers = encode_granted_access(&body.offers).map_err(crate::api::database)?;
-    let now = application_time()?;
-    let tx = state
-        .service
-        .db
-        .begin()
-        .await
-        .map_err(crate::api::database)?;
-    let existing = tx
-        .query_one_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT status, subject_id, expired_after FROM contacts WHERE name = ?",
-            [name.as_str().into()],
-        ))
-        .await
-        .map_err(crate::api::database)?;
-    if let Some(record) = &existing {
-        let status = record
-            .try_get::<i32>("", "status")
-            .map_err(crate::api::database)?;
-        let subject = record
-            .try_get::<Vec<u8>>("", "subject_id")
-            .map_err(crate::api::database)?;
-        if subject != subject_id.as_bytes()
-            || status == ContactStatus::Blocked as i32
-            || (status == ContactStatus::Active as i32 && body.status != ContactStatus::Active)
-        {
-            return Err((
-                http::StatusCode::CONFLICT,
-                "contact identity or status conflicts with existing contact".into(),
-            ));
+impl AccessService {
+    /// Record a peer authenticated by the host's outbound contact workflow.
+    /// This creates only a pending identity binding; it never grants access or
+    /// changes an existing relationship, including its expiry and permissions.
+    pub async fn record_outbound_contact(&self, contact: NewContact) -> Result<(), DbErr> {
+        let name = normalized_name(&contact.name).map_err(|(_, message)| DbErr::Type(message))?;
+        if name != contact.name || name == self.owner_name {
+            return Err(DbErr::Type("invalid outbound contact name".into()));
         }
-    }
-    let fallback = existing
-        .as_ref()
-        .map(|row| row.try_get::<i64>("", "expired_after"))
-        .transpose()
-        .map_err(crate::api::database)?
-        .unwrap_or(now + APPLICATION_LIFETIME_SECONDS);
-    let expires = Expiry {
-        expires_after: body.expires_after,
-        valid_before: body.valid_before,
-    }
-    .resolve(now, fallback)?;
-    tx.execute_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "INSERT INTO contacts(name, subject_id, alias, class, description, status, requests, offers, created_at, updated_at, expired_after) \
-         VALUES(?, ?, nullif(?, ''), ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(name) DO UPDATE SET alias = excluded.alias, class = excluded.class, description = excluded.description, \
-         status = excluded.status, requests = excluded.requests, offers = excluded.offers, updated_at = excluded.updated_at, expired_after = excluded.expired_after",
-        [name.as_str().into(), subject_id.as_bytes().to_vec().into(), alias.into(), body.class.into(), body.description.into(),
-         (body.status as i32).into(), requests.into(), offers.into(), now.into(), now.into(), expires.into()],
-    )).await.map_err(crate::api::database)?;
-    if body.status == ContactStatus::Active {
+        validate_description_length(&contact.description)?;
+        validate_application_times(
+            contact.created_at,
+            contact.updated_at,
+            contact.expired_after,
+        )?;
+        let requests = encode_requested_access(&contact.requested_access)?;
+        let offers = encode_granted_access(&contact.offers)?;
+        let tx = self.db.begin().await?;
+        // A delayed worker must not recreate an identity removed since submission.
+        if tx
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT name FROM contact_deletions WHERE name=? AND updated_at>=?",
+                [name.as_str().into(), contact.created_at.into()],
+            ))
+            .await?
+            .is_some()
+        {
+            return Err(DbErr::RecordNotUpdated);
+        }
+
         tx.execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite, "UPDATE contact_applications SET status = 'active' WHERE applicant_name = ? AND status = 'pending'",
-            [name.as_str().into()],
-        )).await.map_err(crate::api::database)?;
+            DatabaseBackend::Sqlite,
+            "INSERT INTO contacts(name,subject_id,class,description,status,requests,offers,created_at,updated_at,expired_after) \
+             VALUES(?,?,?,?,0,?,?,?,?,?) ON CONFLICT(name) DO NOTHING",
+            [name.as_str().into(), contact.subject_id.as_bytes().to_vec().into(), contact.class.into(), contact.description.into(),
+             requests.into(), offers.into(), contact.created_at.into(), contact.updated_at.into(), contact.expired_after.into()],
+        )).await?;
+        let row = tx
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT subject_id,status,expired_after FROM contacts WHERE name=?",
+                [name.as_str().into()],
+            ))
+            .await?
+            .ok_or(DbErr::RecordNotUpdated)?;
+        let status = row.try_get::<i32>("", "status")?;
+        if row.try_get::<Vec<u8>>("", "subject_id")? != contact.subject_id.as_bytes()
+            || !matches!(
+                ContactStatus::try_from(status),
+                Ok(ContactStatus::Pending | ContactStatus::Active)
+            )
+            || (status == ContactStatus::Pending as i32
+                && row.try_get::<i64>("", "expired_after")? <= contact.updated_at)
+        {
+            return Err(DbErr::RecordNotUpdated);
+        }
+        tx.commit().await?;
+        self.contacts.write().await.insert(name, contact.subject_id);
+        Ok(())
     }
-    tx.commit().await.map_err(crate::api::database)?;
-    state
-        .service
-        .contacts
-        .write()
-        .await
-        .insert(name, subject_id);
-    Ok(if existing.is_none() {
-        http::StatusCode::CREATED
-    } else {
-        http::StatusCode::NO_CONTENT
-    })
 }
 
 fn validate_alias(alias: &str) -> Result<(), crate::api::ApiError> {
