@@ -89,6 +89,7 @@ mod tests {
             include_str!("migrations/0.sql"),
             include_str!("migrations/1.sql"),
             include_str!("migrations/2.sql"),
+            include_str!("migrations/3.sql"),
         ] {
             db.execute_unprepared(migration).await.unwrap();
         }
@@ -303,6 +304,7 @@ mod tests {
             include_str!("migrations/0.sql"),
             include_str!("migrations/1.sql"),
             include_str!("migrations/2.sql"),
+            include_str!("migrations/3.sql"),
         ] {
             db.execute_unprepared(migration).await.unwrap();
         }

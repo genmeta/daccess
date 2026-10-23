@@ -47,7 +47,7 @@ PATCH 接受 status、alias、expires_after、valid_before，至少一个字段�
 - modified_since：列表包含 updated_at >= 此值的联系人，保留同一秒内的更新；客户端按名称合并去重。
 - 增量列表还返回 deleted: [{name, updated_at}]。首次全量不返回历史删除标记；重建联系人会清除旧标记。
 
-开始同步前记录本端时间作为下一轮边界，并读取全部分页；不能将结束时刻作为边界而漏掉读取期间的修改。删除标记独立于分页返回，客户端去重。数据库内部 expired_after 列及公共 Rust ContactRecord 的原字段保留，HTTP 联系人和申请回执统一序列化为 valid_before。ACL 审批列表的 expired_after 表示待办到期时间，已批准的 ACL 无此到期字段。
+开始同步前记录本端时间作为下一轮边界，并读取全部分页；不能将结束时刻作为边界而漏掉读取期间的修改。删除标记独立于分页返回，客户端去重。数据库内部 expired_after 列及公共 Rust ContactRecord 的原字段保留，HTTP 联系人和申请回执统一序列化为 valid_before。ACL 审批列表的 expired_after 表示待办或未消耗一次额度的到期时间，长期 ACL 无此到期限制。
 
 ## 统一 ACL
 
@@ -59,7 +59,7 @@ Named／All 授权面向已验证具名身份或所有访问者，不依赖历�
 
 daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/contact allow **、GET /std/acl/status allow **、POST /std/contact allow **，并显式设置 GET /std/contact/list deny *? 以阻断父路径继承，以及公开 Profile／Workspace／能力发现规则。所有规则允许修改、拒绝、删除，重启不补回；本端发起核验真实所有者及所选授权写入权限，不能伪造 from 代发。
 
-其他 ACL 查询、写入、审批、管理员保护及策略优先级沿用上游 0.1.1；见 UPSTREAM_SPEC.md 的相应算法说明，旧路径和旧 SubjectId 广泛 allow 行为以本文为准。
+其他 ACL 查询、写入、审批、管理员保护及策略优先级除下述审批扩展外沿用上游 0.1.1；见 UPSTREAM_SPEC.md 的相应算法说明，旧路径和旧 SubjectId 广泛 allow 行为以本文为准。
 
 ## 业务请求触发审核
 
@@ -74,19 +74,21 @@ daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/con
 
 `GET /std/acl/review/list?status=pending|expired&kind=all|live|persistent` 默认 pending/all，合并后按 requested_at/id 倒序分页。每条有 `kind`；实时待办 expired_after=null，只出现在 pending。实时 id 与持久 id 是两个命名空间，PATCH 必须携带 kind（省略兼容为 persistent）。已断开或超时的实时待办不显示为过期历史。
 
-`PATCH /std/acl/review`：`{"id":12,"kind":"persistent","action":"allow"}`，action 为 allow/deny；不需要决定有效期。`DELETE /std/acl/review?id={id}` 仍只删除已过期的异步 pending 记录。
+`PATCH /std/acl/review`：`{"id":12,"kind":"persistent","action":"allow","remember":false}`。action 为 allow/deny，remember 必填且必须为布尔值；缺失返回 422。列表顶层返回 `decision_modes:["once","always"]`。客户端未确认该能力时不能发送新语义决定，以免旧后端忽略字段而保存长期 ACL。
 
-批准在一个数据库事务中写入该具名身份对原 method 和规范化 API 路径的普通 `allow`，更新对应异步记录，提交后更新策略索引并唤醒同一身份、SubjectId、method、path 的所有实时等待。后续访问直接通过 ACL，重启仍有效，直到管理员修改、撤销或删除联系人。拒绝对称写入普通 `deny`。ACL 路径段前缀匹配与其他规则一致，不绑定某次请求正文或某条消息，不扩大到其他 method。
+`remember=false` 不改 ACL：异步本次允许为 visitor、SubjectId、method、规范化 API 路径提供一个 10 分钟有效的数据库额度，由下一次匹配调用原子消耗；不比较 query、正文或消息 ID，不覆盖子路径。正常 ACL allow 不消耗额度，deny 优先。通过一次鉴权即消耗，不因业务失败、取消或响应丢失退还。同步本次允许／拒绝只完成选中的实时等待请求，不生成异步额度。本次拒绝结束选中异步轮次，所有跟踪该编号的任务停止本轮重试；后续业务可创建新轮次。
 
-已存在联系人须仍匹配原 SubjectId，且不能通过批准撤销拉黑；否则返回 409，先显式处理联系人身份或关系冲突。陌生身份审批时建立 pending 联系人用于保存可信 SubjectId，不接受好友关系，不修改已有别称、关系状态或其他权限。审批入口自身经过统一 ACL，并保留最后管理员保护。
+`remember=true` 在事务中写入该具名身份对原 method 和规范化 API 路径的普通 allow/deny，更新相同范围的待审记录；提交后更新策略索引并唤醒相同范围的实时等待。长期 ACL 按既有路径段前缀规则匹配，重启后有效，直到显式修改或撤销。
 
-联系人申请／接受仅处理关系，requested_access 不再由 Workspace 合成访问审批；真正的访问审批来自业务请求。新远端联系人申请即使未声明 requested_access 也保持 pending，已有 active 关系保留。
+已有联系人必须匹配原 SubjectId，批准不能撤销拉黑，否则返回 409。仅长期决定为陌生身份建立 pending 身份绑定；所有 API 决定均不接受好友、不隐含授予其他接口。联系人申请／接受及显式初始能力选择使用单独流程，不从 requested_access 合成 API 待审。
 
-已批准记录的状态是历史回执，当前访问始终由 ACL 决定。
+状态查询继续校验真实名称与 SubjectId，返回 `status`、`remember` 和 `valid_before`。状态为 pending/allowed/denied/expired/consumed，查询不消耗额度。异步调用方只在 pending 时轮询；allowed/consumed 恢复原操作并重新经过正常鉴权，denied/expired 停止当前任务。一个范围可共享待审编号，但始终只提供一个额度。已结束编号不复用，重复相同决定幂等，冲突决定返回 409。长期决定结果是历史回执；一次额度被相关方法／路径 ACL 修改、联系人身份／状态变更或删除撤销后为 expired。
+
+`DELETE /std/acl/review?id={id}` 只删除已过期的 pending 或未消耗且失效的一次允许记录。已消费和已拒绝记录保留结果。
 
 ## 数据库结构迁移
 
-保留 `src/migrations/0.sql`、`1.sql` 和 `2.sql` 的版本迁移链。新库先创建基线结构，已有 v0/v1 数据库在原库中按版本事务升级到 v2。v2 重建联系人表以允许过期后修改、使用重复别称，并增加更新时间索引、删除记录和触发器。迁移保留联系人、ACL、审批和申请回执数据，以及联系人 id 和自增序列。
+保留 `src/migrations/0.sql` 至 `3.sql` 的版本迁移链。新库先创建基线结构，已有 v0/v1/v2 数据库在原库中按版本事务升级到 v3。v2 重建联系人表以允许过期后修改、使用重复别称，并增加更新时间索引、删除记录和触发器。v3 保存决定模式、决定时间、额度过期、消耗和撤销时间，待审范围使用部分唯一索引，历史结果不再与新轮次互斥。历史已决记录按长期决定迁移，不生成额度；历史重复待审保留编号，除最新一条外标记过期。迁移保留联系人、ACL、审批和申请回执数据，以及 id 和自增序列。
 
 迁移只调整结构，不改写历史 ACL 路径、不删除规则、不插入默认授权。旧接口规则由管理员自行调整。迁移失败回滚当前事务，不自动创建新库替换原库。无法识别的格式和不支持的版本报错并保留原文件。已有数据库升级或重启均不补默认规则。
 
@@ -95,6 +97,6 @@ daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/con
 
 `GET/POST /std/acl/access?api=/std/message`，`GET/PATCH/DELETE /std/acl/allow?name=NAME`。GET 缺省目标保留原全部树响应，有目标保留原单对象响应。api 要求开头 /，name 保留特殊 Grantee（?、*?、**、组名@签发者）。标准 query 编码，重复、空目标及写入缺目标为 400。
 
-`GET /std/acl/review/list`，`GET /std/acl/status?id=ID`，`DELETE /std/acl/review?id=ID`。id 必须唯一且为正整数；PATCH /std/acl/review 的 body 不变。状态查询继续绑定真实 Visitor 的名称和主体。旧对象路径不再注册，旧对象级授权不自动转换为固定入口管理权限。
+`GET /std/acl/review/list`，`GET /std/acl/status?id=ID`，`DELETE /std/acl/review?id=ID`。id 必须唯一且为正整数；PATCH /std/acl/review 的 body 使用上文必填的 remember 字段。状态查询继续绑定真实 Visitor 的名称和主体。旧对象路径不再注册，旧对象级授权不自动转换为固定入口管理权限。
 
 `/std/acl/permissions` 仍由宿主提供只读 GET；PUT/DELETE 由其他任务实施。
