@@ -15,7 +15,7 @@
 - 按 API 路径最长匹配规则，支持指定 method 或 `*`。
 - 支持精确联系人、所有已命名来访者、匿名来访者和所有来访者等 grantee。
 - 联系人申请、批准、权限同步、拉黑和恢复。
-- 业务请求触发审核：`If-Reviewed: waiting` 在内存等待，`break` 持久化待办并返回 `400 need_review`；批准后写入普通 ACL，后续持续允许。
+- 业务请求触发审核：`If-Reviewed: waiting` 在内存等待，`break` 持久化待办并返回 `400 need_review`；支持本次允许／拒绝，以及记住选择后写入普通 ACL。
 - SQLite 持久化与内存 Policies 一致性更新。
 - 可直接挂载到 Axum Router 的管理 API。
 
@@ -112,11 +112,14 @@ match acl
 
 `waiting` 返回 `AuthResult::Waiting`，适配器等待此 Future 后继续原业务请求。待办只存内存，取消、超时或进程退出时清理。Pishoo 将等待上限设为 300 秒。`break` 返回 `AuthResult::Reviewing`，适配器应返回 400 与 `PendingReviewResponse`，并设置 `Cache-Control: no-store`。
 
-管理员批准时持久化该 visitor 对 method/path 的普通 ACL `allow`，再放行同一身份和接口的所有等待请求；后续请求持续允许，重启后仍生效，可通过普通 ACL 修改或撤销。拒绝同样写入 `deny`。审批不自动接受联系人关系，也不授权其他接口。
+`PATCH /std/acl/review` 必须提供 `remember` 布尔值，例如 `{"id":12,"kind":"persistent","action":"allow","remember":false}`。`GET /std/acl/review/list` 返回 `decision_modes: ["once", "always"]`，供客户端确认支持新语义。
 
-400 响应中的 `status_url` 仅允许原已验证身份查询，返回 `pending`、`allowed`、`denied` 或 `expired`；也可直接重试原业务请求，无须提前查询权限。状态端点经过统一 ACL 并校验记录归属。审批记录的到期时间只限制待审批时间，不限制已保存 ACL 的有效期。
+- `remember=false`：本次允许只放行下一次匹配 visitor、SubjectId、method、规范化 path 的调用，默认 10 分钟内有效，数据库原子消耗并可跨重启恢复；本次拒绝结束当前审批轮次。两者均不修改 ACL 或接受联系人。同步等待只完成选中的请求，不额外生成额度。
+- `remember=true`：保存普通 allow/deny ACL，提交后处理相同范围的待审请求。只有长期决定才会为陌生身份建立 pending 身份绑定，不接受好友关系。
 
-服务端从 method、规范化 path、visitor 与 SubjectId 派生内部 request ID，仅用于异步待办去重；不含 query、普通 headers 或正文。调用方不能覆盖它。完整协议见 [SPEC.md](SPEC.md)。
+`status_url` 仅允许原已验证身份查询，返回 `pending`、`allowed`、`denied`、`expired` 或 `consumed`，以及 `remember`、`valid_before`。异步调用方保存审批编号并轮询状态，pending 时不重发业务；denied／expired 停止本轮任务，allowed／consumed 恢复业务调用并按当前 ACL 重新鉴权。状态查询不消耗额度，consumed 仅代表通过过鉴权，不保证业务成功；失败、取消或响应丢失不退还额度。长期 ACL 不受审批到期时间限制。
+
+内部 request ID 从 method、规范化 path、visitor 和 SubjectId 派生，只用于待审范围去重，不含 query、普通 headers 或正文。已决定编号不复用，新一轮生成新编号；重复提交相同决定不会再产生额度。相关方法／路径的 ACL 修改以及联系人身份、状态变更或删除会撤销旧额度。完整协议见 [SPEC.md](SPEC.md)。
 
 ### 4. 挂载管理 API
 

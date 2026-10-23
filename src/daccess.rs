@@ -5,6 +5,9 @@ mod policy;
 mod review;
 mod service;
 
+#[cfg(test)]
+mod review_tests;
+
 pub use api::{
     ContactPatch, ContactRecord, GrantedAccess, GrantedMethods, NewContact, RequestedAccess,
     ReviewRecord, router as management_router,

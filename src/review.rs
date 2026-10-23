@@ -99,6 +99,7 @@ pub enum ReviewStatus {
     Allowed,
     Denied,
     Expired,
+    Consumed,
 }
 
 /// How a request handles an ACL review. Omitted headers default to asynchronous review.
@@ -220,6 +221,17 @@ impl LiveReviews {
             .requests
             .get(&id)
             .map(|(request, _)| request.target.clone())
+    }
+
+    pub fn resolve_one(&self, id: u64, action: Action) -> Result<(), sea_orm::DbErr> {
+        let (_, sender) = self
+            .lock()
+            .requests
+            .remove(&id)
+            .ok_or_else(|| sea_orm::DbErr::RecordNotFound(format!("live review {id}")))?;
+        sender
+            .send(action)
+            .map_err(|_| sea_orm::DbErr::RecordNotUpdated)
     }
 
     pub fn resolve(&self, target: &ReviewTarget, action: Action) {
@@ -394,7 +406,8 @@ mod protocol_tests {
                 .uri("/std/acl/review")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
-                    serde_json::json!({"kind":"live","id":id,"action":"allow"}).to_string(),
+                    serde_json::json!({"kind":"live","id":id,"action":"allow","remember":true})
+                        .to_string(),
                 ))
                 .unwrap()
         };
@@ -459,7 +472,7 @@ mod protocol_tests {
             matches!(service.auth(retry.clone(), Some("alice.example"), Some(&subject)).await.unwrap(), AuthResult::Reviewing(other) if review.id() == other.id())
         );
         service
-            .decide_review(review.id(), Action::Allow)
+            .decide_review(review.id(), Action::Allow, true)
             .await
             .unwrap();
         assert!(matches!(
