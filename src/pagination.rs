@@ -45,7 +45,9 @@ impl Pagination {
 #[derive(Deserialize)]
 #[serde(default)]
 pub(crate) struct PageQuery<S> {
+    #[serde(deserialize_with = "deserialize_query_u64")]
     page: u64,
+    #[serde(deserialize_with = "deserialize_query_u64")]
     page_size: u64,
     pub(crate) sort: S,
     #[serde(deserialize_with = "deserialize_order")]
@@ -88,6 +90,24 @@ impl<T> Page<T> {
             page: pagination.page,
             page_size: pagination.page_size,
         }
+    }
+}
+
+fn deserialize_query_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Flattened URL query fields reach Serde as strings without numeric coercion.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Number {
+        Integer(u64),
+        Text(String),
+    }
+
+    match Number::deserialize(deserializer)? {
+        Number::Integer(value) => Ok(value),
+        Number::Text(value) => value.parse().map_err(D::Error::custom),
     }
 }
 

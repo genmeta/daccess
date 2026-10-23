@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use crate::{
     Effect, Grantee, Headers, Method, PendingReview, Policies, ReviewStatus, SubjectId,
     policy::{PolicyError, database_api},
-    review::RequestId,
+    review::{LiveReviews, RequestId},
 };
 
 pub struct AccessService {
@@ -18,14 +18,17 @@ pub struct AccessService {
     pub(crate) owner_name: String,
     pub(crate) contacts: RwLock<Trie<String, SubjectId>>,
     pub(crate) policies: RwLock<Policies>,
+    pub(crate) reviews: LiveReviews,
 }
 
 impl AccessService {
-    const MIGRATIONS: [&'static str; 2] = [
+    const MIGRATIONS: [&'static str; 4] = [
         include_str!("migrations/0.sql"),
         include_str!("migrations/1.sql"),
+        include_str!("migrations/2.sql"),
+        include_str!("migrations/3.sql"),
     ];
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 3;
 
     pub fn new(db: DatabaseConnection, owner_name: impl Into<String>) -> Self {
         Self {
@@ -33,6 +36,7 @@ impl AccessService {
             owner_name: owner_name.into(),
             contacts: RwLock::new(Trie::new()),
             policies: RwLock::new(Policies::default()),
+            reviews: LiveReviews::default(),
         }
     }
 
@@ -46,7 +50,7 @@ impl AccessService {
         Self::load(db, name, subject_id).await
     }
 
-    async fn migrate(db: &DatabaseConnection) -> Result<(), DbErr> {
+    pub(crate) async fn migrate(db: &DatabaseConnection) -> Result<(), DbErr> {
         let module_exists = db
             .query_one_raw(Statement::from_string(
                 DatabaseBackend::Sqlite,
@@ -57,6 +61,18 @@ impl AccessService {
 
         if !module_exists {
             let transaction = db.begin().await?;
+            if transaction
+                .query_one_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1",
+                ))
+                .await?
+                .is_some()
+            {
+                return Err(DbErr::Type(String::from(
+                    "unrecognized access database format",
+                )));
+            }
             transaction.execute_unprepared(Self::MIGRATIONS[0]).await?;
             transaction.commit().await?;
         }
@@ -69,18 +85,24 @@ impl AccessService {
             .await?
             .ok_or_else(|| DbErr::Type(String::from("module table is empty")))?;
         let version = i64::try_get(&module, "", "version")?;
-        if version == 0 {
+        if !(0..=i64::from(Self::VERSION)).contains(&version) {
+            return Err(DbErr::Type(format!(
+                "unsupported access database version {version}"
+            )));
+        }
+        for next in (version + 1)..=i64::from(Self::VERSION) {
             let transaction = db.begin().await?;
-            transaction.execute_unprepared(Self::MIGRATIONS[1]).await?;
             transaction
-                .execute_unprepared("UPDATE module SET version = 1 WHERE module_name = 'access'")
+                .execute_unprepared(Self::MIGRATIONS[next as usize])
+                .await?;
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE module SET version = ? WHERE module_name = 'access'",
+                    [next.into()],
+                ))
                 .await?;
             transaction.commit().await?;
-        } else if version != i64::from(Self::VERSION) {
-            return Err(DbErr::Type(format!(
-                "unsupported access database version {version}; expected schema version {}",
-                Self::VERSION,
-            )));
         }
         Ok(())
     }
@@ -114,6 +136,7 @@ impl AccessService {
             owner_name: owner_name.to_owned(),
             contacts: RwLock::new(contacts),
             policies: RwLock::new(policies),
+            reviews: LiveReviews::default(),
         })
     }
 
@@ -166,6 +189,7 @@ impl AccessService {
         name: Option<&str>,
         subject_id: Option<&SubjectId>,
     ) -> Result<AuthResult, DbErr> {
+        let mode = crate::ReviewMode::from_headers(&headers.fields)?;
         if name.is_some() != subject_id.is_some() {
             return Err(DbErr::Type(String::from(
                 "name and subject_id must either both be present or both be absent",
@@ -187,11 +211,10 @@ impl AccessService {
             Some(name) => vec![Grantee::One(name.to_owned()), Grantee::Named, Grantee::All],
             None => vec![Grantee::Anony, Grantee::All],
         };
-        let (policy_effect, policy_method, policy_api, policy_grantee) = self
-            .policies
-            .read()
-            .await
-            .evaluate(&headers.method, &api, &grantees);
+        // Keep registration and policy evaluation atomic with respect to a review decision.
+        let policies = self.policies.read().await;
+        let (policy_effect, policy_method, policy_api, policy_grantee) =
+            policies.evaluate(&headers.method, &api, &grantees);
         let subject_changed = match (name, subject_id) {
             (Some(name), Some(subject_id)) => self
                 .contacts
@@ -202,7 +225,12 @@ impl AccessService {
             _ => false,
         };
         let reason = match policy_effect {
-            Effect::Allow if subject_changed => String::from("subject_id changed"),
+            Effect::Allow
+                if subject_changed
+                    && matches!(policy_grantee, Grantee::One(_) | Grantee::Group { .. }) =>
+            {
+                String::from("subject_id changed")
+            }
             Effect::Allow => return Ok(AuthResult::Allowed),
             Effect::Deny => return Ok(AuthResult::Denied),
             Effect::Review => format!(
@@ -218,8 +246,24 @@ impl AccessService {
             // initiated it. Anonymous review requests therefore fail closed.
             return Ok(AuthResult::Denied);
         };
+        let consumed = self.db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE access_reviews SET consumed_at=CAST(strftime('%s','now') AS INTEGER),updated_at=CAST(strftime('%s','now') AS INTEGER) WHERE id=(SELECT id FROM access_reviews WHERE visitor=? AND visitor_sid=? AND method=? AND api=? AND stage=1 AND remember=0 AND consumed_at IS NULL AND invalidated_at IS NULL AND grant_expires_at>CAST(strftime('%s','now') AS INTEGER) ORDER BY id LIMIT 1) AND consumed_at IS NULL AND invalidated_at IS NULL",
+            [visitor.into(), visitor_sid.as_bytes().to_vec().into(), headers.method.as_str().into(), api.as_str().into()],
+        )).await?.rows_affected();
+        if consumed == 1 {
+            return Ok(AuthResult::Allowed);
+        }
+        if mode == crate::ReviewMode::Waiting {
+            return Ok(AuthResult::Waiting(self.reviews.add(
+                visitor,
+                visitor_sid,
+                &headers,
+                reason,
+            )));
+        }
         let request_id = RequestId::for_request(&headers, visitor, visitor_sid);
-        match self
+        let id = self
             .persistent_review(
                 visitor,
                 visitor_sid,
@@ -228,12 +272,8 @@ impl AccessService {
                 &api,
                 &reason,
             )
-            .await?
-        {
-            StoredReviewStatus::Allowed => Ok(AuthResult::Allowed),
-            StoredReviewStatus::Denied => Ok(AuthResult::Denied),
-            StoredReviewStatus::Pending(id) => Ok(AuthResult::Reviewing(PendingReview::new(id))),
-        }
+            .await?;
+        Ok(AuthResult::Reviewing(PendingReview::new(id)))
     }
 
     async fn persistent_review(
@@ -244,134 +284,19 @@ impl AccessService {
         method: &str,
         api: &str,
         reason: &str,
-    ) -> Result<StoredReviewStatus, DbErr> {
-        let transaction = self.db.begin().await?;
-        let decided = transaction
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                r#"DELETE FROM access_reviews
-                   WHERE visitor = ? AND request_id = ? AND visitor_sid = ?
-                     AND method = ? AND api = ?
-                     AND stage IN (1, 2)
-                     AND expired_after > CAST(strftime('%s', 'now') AS INTEGER)
-                   RETURNING stage"#,
-                [
-                    visitor.into(),
-                    request_id.into(),
-                    visitor_sid.as_bytes().to_vec().into(),
-                    method.into(),
-                    api.into(),
-                ],
-            ))
-            .await?;
-        if let Some(row) = decided {
-            let review = match i32::try_get(&row, "", "stage")? {
-                1 => StoredReviewStatus::Allowed,
-                2 => StoredReviewStatus::Denied,
-                stage => {
-                    return Err(DbErr::Type(format!(
-                        "invalid persistent review stage {stage}"
-                    )));
-                }
-            };
-            transaction.commit().await?;
-            return Ok(review);
-        }
-
-        let row = transaction
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                r#"SELECT id, visitor_sid, method, api, stage,
-                          CASE WHEN expired_after > CAST(strftime('%s', 'now') AS INTEGER)
-                               THEN 1 ELSE 0 END AS valid
-                   FROM access_reviews
-                   WHERE visitor = ? AND request_id = ?"#,
-                [visitor.into(), request_id.into()],
-            ))
-            .await?;
-
-        let Some(row) = row else {
-            let row = transaction
-                .query_one_raw(Statement::from_sql_and_values(
-                    DatabaseBackend::Sqlite,
-                    r#"INSERT INTO access_reviews
-                       (request_id, visitor, visitor_sid, method, api, stage, reason,
-                        expired_after, updated_at, created_at)
-                       VALUES (?, ?, ?, ?, ?, 0, ?,
-                               CAST(strftime('%s', 'now', '+1 day') AS INTEGER),
-                               CAST(strftime('%s', 'now') AS INTEGER),
-                               CAST(strftime('%s', 'now') AS INTEGER))
-                       RETURNING id"#,
-                    [
-                        request_id.into(),
-                        visitor.into(),
-                        visitor_sid.as_bytes().to_vec().into(),
-                        method.into(),
-                        api.into(),
-                        reason.into(),
-                    ],
-                ))
-                .await?;
-            let id = i64::try_get(
-                &row.expect("INSERT ... RETURNING always returns the inserted row"),
-                "",
-                "id",
-            )?;
-            transaction.commit().await?;
-            return Ok(StoredReviewStatus::Pending(id));
-        };
-
-        let id = i64::try_get(&row, "", "id")?;
-        let stored_method = String::try_get(&row, "", "method")?;
-        let stored_api = String::try_get(&row, "", "api")?;
-        if stored_method != method || stored_api != api {
-            return Err(DbErr::Type(format!(
-                "request ID for {visitor:?} is already bound to {stored_method} {stored_api}"
-            )));
-        }
-
-        let stage = i32::try_get(&row, "", "stage")?;
-        let valid = i32::try_get(&row, "", "valid")? != 0;
-        let stored_sid = Vec::<u8>::try_get(&row, "", "visitor_sid")?;
-        if valid && stored_sid != visitor_sid.as_bytes() {
-            return Err(DbErr::Type(format!(
-                "request ID for {visitor:?} is already bound to another subject_id"
-            )));
-        }
-        let review = if valid {
-            match stage {
-                0 => StoredReviewStatus::Pending(id),
-                1 => StoredReviewStatus::Allowed,
-                2 => StoredReviewStatus::Denied,
-                _ => {
-                    return Err(DbErr::Type(format!(
-                        "invalid persistent review stage {stage}"
-                    )));
-                }
-            }
-        } else {
-            transaction
-                .execute_raw(Statement::from_sql_and_values(
-                    DatabaseBackend::Sqlite,
-                    r#"UPDATE access_reviews
-                       SET stage = 0,
-                           visitor_sid = ?,
-                           reason = ?,
-                           expired_after = CAST(strftime('%s', 'now', '+1 day') AS INTEGER),
-                           updated_at = CAST(strftime('%s', 'now') AS INTEGER)
-                       WHERE id = ?"#,
-                    [
-                        visitor_sid.as_bytes().to_vec().into(),
-                        reason.into(),
-                        id.into(),
-                    ],
-                ))
-                .await?;
-            StoredReviewStatus::Pending(id)
-        };
-
-        transaction.commit().await?;
-        Ok(review)
+    ) -> Result<i64, DbErr> {
+        // A resolved round keeps its ID and outcome. Only pending rounds deduplicate.
+        self.db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE access_reviews SET stage=3,updated_at=CAST(strftime('%s','now') AS INTEGER) WHERE visitor=? AND visitor_sid=? AND method=? AND api=? AND stage=0 AND expired_after<=CAST(strftime('%s','now') AS INTEGER)",
+            [visitor.into(), visitor_sid.as_bytes().to_vec().into(), method.into(), api.into()],
+        )).await?;
+        let row = self.db.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO access_reviews(request_id,visitor,visitor_sid,method,api,stage,reason,expired_after,updated_at,created_at) VALUES(?,?,?,?,?,0,?,CAST(strftime('%s','now','+1 day') AS INTEGER),CAST(strftime('%s','now') AS INTEGER),CAST(strftime('%s','now') AS INTEGER)) ON CONFLICT(visitor,visitor_sid,method,api) WHERE stage=0 DO UPDATE SET reason=excluded.reason RETURNING id",
+            [request_id.into(),visitor.into(),visitor_sid.as_bytes().to_vec().into(),method.into(),api.into(),reason.into()],
+        )).await?.ok_or_else(|| DbErr::RecordNotInserted)?;
+        row.try_get("", "id")
     }
 
     pub fn database(&self) -> &DatabaseConnection {
@@ -384,46 +309,65 @@ impl AccessService {
         visitor: &str,
         subject_id: &SubjectId,
     ) -> Result<ReviewStatus, DbErr> {
-        let row = self
-            .db
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Sqlite,
-                "SELECT stage, expired_after > CAST(strftime('%s', 'now') AS INTEGER) AS valid \
-                 FROM access_reviews WHERE id = ? AND visitor = ? AND visitor_sid = ?",
-                [
-                    id.into(),
-                    visitor.into(),
-                    subject_id.as_bytes().to_vec().into(),
-                ],
-            ))
-            .await?
-            .ok_or_else(|| DbErr::RecordNotFound(format!("review {id}")))?;
-        if i32::try_get(&row, "", "valid")? == 0 {
-            return Ok(ReviewStatus::Expired);
-        }
-        match i32::try_get(&row, "", "stage")? {
-            0 => Ok(ReviewStatus::Pending),
-            1 => Ok(ReviewStatus::Allowed),
-            2 => Ok(ReviewStatus::Denied),
-            stage => Err(DbErr::Type(format!(
-                "invalid persistent review stage {stage}"
-            ))),
-        }
+        self.review_status_details(id, visitor, subject_id)
+            .await
+            .map(|details| details.0)
+    }
+
+    pub(crate) async fn review_status_details(
+        &self,
+        id: i64,
+        visitor: &str,
+        subject_id: &SubjectId,
+    ) -> Result<(ReviewStatus, Option<bool>, Option<i64>), DbErr> {
+        let row = self.db.query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT stage,expired_after,remember,grant_expires_at,consumed_at,invalidated_at FROM access_reviews WHERE id=? AND visitor=? AND visitor_sid=?",
+            [id.into(),visitor.into(),subject_id.as_bytes().to_vec().into()],
+        )).await?.ok_or_else(|| DbErr::RecordNotFound(format!("review {id}")))?;
+        let stage: i32 = row.try_get("", "stage")?;
+        let remember = row
+            .try_get::<Option<i32>>("", "remember")?
+            .map(|value| value != 0);
+        let grant_expires: Option<i64> = row.try_get("", "grant_expires_at")?;
+        let expired_after: i64 = row.try_get("", "expired_after")?;
+        let time = chrono::Utc::now().timestamp();
+        let status = match stage {
+            0 if expired_after > time => ReviewStatus::Pending,
+            0 | 3 => ReviewStatus::Expired,
+            1 if remember == Some(false) => {
+                if row.try_get::<Option<i64>>("", "consumed_at")?.is_some() {
+                    ReviewStatus::Consumed
+                } else if row.try_get::<Option<i64>>("", "invalidated_at")?.is_some()
+                    || grant_expires.is_none_or(|expires| expires <= time)
+                {
+                    ReviewStatus::Expired
+                } else {
+                    ReviewStatus::Allowed
+                }
+            }
+            1 => ReviewStatus::Allowed,
+            2 => ReviewStatus::Denied,
+            _ => return Err(DbErr::Type(format!("invalid review stage {stage}"))),
+        };
+        Ok((
+            status,
+            remember,
+            if remember == Some(false) && stage == 1 {
+                grant_expires
+            } else {
+                Some(expired_after)
+            },
+        ))
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum AuthResult {
     Allowed,
     Denied,
     Reviewing(PendingReview),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StoredReviewStatus {
-    Pending(i64),
-    Allowed,
-    Denied,
+    Waiting(crate::LiveReview),
 }
 
 impl From<PolicyError> for DbErr {
@@ -448,9 +392,7 @@ mod tests {
 
     async fn service() -> AccessService {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        db.execute_unprepared(AccessService::MIGRATIONS[0])
-            .await
-            .unwrap();
+        AccessService::migrate(&db).await.unwrap();
         AccessService::new(db, "owner.example")
     }
 
@@ -474,8 +416,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_post_rules_and_approvals_never_authorize_message_put() {
+        let service = AccessService::load_from_db(
+            "sqlite::memory:",
+            "owner.example",
+            &SubjectId::new(b"owner").unwrap(),
+        )
+        .await
+        .unwrap();
+        let subject = SubjectId::new(b"alice").unwrap();
+        service
+            .set_policy(
+                Method::Specified(http::Method::POST),
+                "/std/message",
+                Effect::Allow,
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::POST, "/std/message"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Allowed
+        ));
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::PUT, "/std/message"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Denied
+        ));
+        service.db.execute_unprepared("INSERT INTO access_reviews(request_id,visitor,visitor_sid,method,api,stage,reason,expired_after,updated_at,created_at) VALUES('old-post','alice.example',X'616c696365','POST','/std/message',0,'old request',4070995200,1,1)").await.unwrap();
+        service
+            .decide_review(1, crate::Action::Allow, true)
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::PUT, "/std/message"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Denied
+        ));
+        service
+            .set_policy(
+                Method::Specified(http::Method::PUT),
+                "/std/message",
+                Effect::Review,
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::PUT, "/std/message"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Reviewing(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn version_zero_migration_creates_and_constrains_the_schema() {
-        let service = service().await;
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared(AccessService::MIGRATIONS[0])
+            .await
+            .unwrap();
+        let service = AccessService::new(db, "owner.example");
         let tables = service
             .db
             .query_one_raw(Statement::from_string(
@@ -701,7 +726,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(i64::try_get(&module, "", "version").unwrap(), 1);
+        assert_eq!(i64::try_get(&module, "", "version").unwrap(), 3);
         let columns = service
             .db
             .query_all_raw(Statement::from_string(
@@ -728,7 +753,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/std/contacts"),
+                    headers(http::Method::GET, "/std/contact/list"),
                     Some("me.example"),
                     Some(&SubjectId::new([1]).unwrap())
                 )
@@ -739,7 +764,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/std/contacts"),
+                    headers(http::Method::GET, "/std/contact/list"),
                     Some("other.example"),
                     Some(&SubjectId::new([2]).unwrap())
                 )
@@ -750,7 +775,7 @@ mod tests {
         assert!(matches!(
             service
                 .auth(
-                    headers(http::Method::GET, "/std/contacts"),
+                    headers(http::Method::GET, "/std/contact/list"),
                     Some("me.example"),
                     Some(&SubjectId::new([2]).unwrap())
                 )
@@ -766,7 +791,7 @@ mod tests {
         db.execute_unprepared(AccessService::MIGRATIONS[0])
             .await
             .unwrap();
-        db.execute_unprepared("UPDATE module SET version = 2")
+        db.execute_unprepared("UPDATE module SET version = 99")
             .await
             .unwrap();
 
@@ -1104,6 +1129,7 @@ mod tests {
     #[tokio::test]
     async fn auth_changes_allow_to_review_when_subject_id_changed() {
         let service = service().await;
+        service.db.execute_unprepared("INSERT INTO contacts(name,subject_id,class,description,status,expired_after,created_at,updated_at) VALUES('alice.example',X'01','','',2,4070995200,1,1)").await.unwrap();
         service
             .contacts
             .write()
@@ -1114,7 +1140,7 @@ mod tests {
                 Method::Specified(http::Method::GET),
                 "/profile",
                 Effect::Allow,
-                Grantee::Named,
+                Grantee::One("alice.example".into()),
             )
             .await
             .unwrap();
@@ -1272,7 +1298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_consumes_an_existing_review_decision() {
+    async fn old_review_decisions_cannot_authorize_without_an_acl_rule() {
         let service = service().await;
         service
             .set_policy(
@@ -1315,7 +1341,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, AuthResult::Allowed));
+        assert!(matches!(result, AuthResult::Reviewing(_)));
         let count = service
             .db
             .query_one_raw(Statement::from_string(
@@ -1325,6 +1351,170 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(i64::try_get(&count, "", "count").unwrap(), 0);
+        assert_eq!(i64::try_get(&count, "", "count").unwrap(), 2);
+    }
+    #[tokio::test]
+    async fn broad_allow_is_independent_of_contact_identity_history_and_remains_revocable() {
+        let service = service().await;
+        service
+            .contacts
+            .write()
+            .await
+            .insert("alice.example".into(), SubjectId::new([1]).unwrap());
+        service
+            .set_policy(
+                Method::Specified(http::Method::GET),
+                "/std/acl/status",
+                Effect::Allow,
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        let subject = SubjectId::new([2]).unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::GET, "/std/acl/status?id=12"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Allowed
+        ));
+        service
+            .remove_policy(
+                Method::Specified(http::Method::GET),
+                "/std/acl/status",
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .auth(
+                    headers(http::Method::GET, "/std/acl/status?id=12"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Denied
+        ));
+    }
+    #[tokio::test]
+    async fn review_approval_survives_reload_and_remains_revocable_and_identity_bound() {
+        let service = AccessService::load_from_db(
+            "sqlite::memory:",
+            "owner.example",
+            &SubjectId::new(b"owner").unwrap(),
+        )
+        .await
+        .unwrap();
+        service
+            .set_policy(
+                Method::Specified(http::Method::POST),
+                "/deploy",
+                Effect::Review,
+                Grantee::Named,
+            )
+            .await
+            .unwrap();
+        let subject = SubjectId::new(b"alice").unwrap();
+        let AuthResult::Reviewing(review) = service
+            .auth(
+                headers(http::Method::POST, "/deploy"),
+                Some("alice.example"),
+                Some(&subject),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected review")
+        };
+        service
+            .decide_review(review.id(), crate::Action::Allow, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .find_contact_by_name("alice.example")
+                .await
+                .unwrap()
+                .status,
+            crate::ContactStatus::Pending as i32
+        );
+        let reloaded = AccessService::load(
+            service.db.clone(),
+            "owner.example",
+            &SubjectId::new(b"owner").unwrap(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            assert!(matches!(
+                reloaded
+                    .auth(
+                        headers(http::Method::POST, "/deploy"),
+                        Some("alice.example"),
+                        Some(&subject)
+                    )
+                    .await
+                    .unwrap(),
+                AuthResult::Allowed
+            ));
+        }
+        assert!(matches!(
+            reloaded
+                .auth(
+                    headers(http::Method::POST, "/deploy"),
+                    Some("alice.example"),
+                    Some(&SubjectId::new(b"replacement").unwrap())
+                )
+                .await
+                .unwrap(),
+            AuthResult::Reviewing(_)
+        ));
+        assert!(matches!(
+            reloaded
+                .auth(
+                    headers(http::Method::POST, "/deploy"),
+                    Some("bob.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Reviewing(_)
+        ));
+        assert!(matches!(
+            reloaded
+                .auth(
+                    headers(http::Method::GET, "/deploy"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Denied
+        ));
+        reloaded
+            .remove_policy(
+                Method::Specified(http::Method::POST),
+                "/deploy",
+                Grantee::One("alice.example".into()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reloaded
+                .auth(
+                    headers(http::Method::POST, "/deploy"),
+                    Some("alice.example"),
+                    Some(&subject)
+                )
+                .await
+                .unwrap(),
+            AuthResult::Reviewing(_)
+        ));
     }
 }

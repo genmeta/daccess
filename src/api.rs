@@ -19,210 +19,32 @@ pub(crate) struct ApiState {
 
 pub fn router(service: Arc<AccessService>) -> Router {
     Router::new()
+        .route("/std/contact/list", get(contact::list))
         .route(
-            "/std/contacts",
-            get(contact::list).delete(contact::delete_many),
-        )
-        .route("/std/contact", axum::routing::post(contact::create))
-        .route("/std/contact/self", get(contact::self_status))
-        .route(
-            "/std/contact/{name}",
+            "/std/contact",
             get(contact::get)
-                .put(put_contact)
+                .post(contact::create)
                 .patch(contact::patch)
                 .delete(contact::delete),
         )
-        .route("/std/acl/access", get(access::list_all_rules_by_api))
         .route(
-            "/std/acl/access/{*api}",
+            "/std/acl/access",
             get(access::list_rules_by_api).post(access::set_by_api),
         )
         .route("/std/acl/apis", get(access::list_apis))
-        .route("/std/acl/allow", get(access::list_all_rules_by_name))
         .route(
-            "/std/acl/allow/{name}",
+            "/std/acl/allow",
             get(access::list_rules_by_name)
                 .patch(access::set_by_name)
                 .delete(access::delete_by_name),
         )
-        .route("/std/acl/review", axum::routing::patch(review::decide))
-        .route("/std/acl/reviews", get(review::list_persistent))
-        .route("/std/acl/review/{id}", axum::routing::delete(
-            |axum::extract::State(state): axum::extract::State<ApiState>, axum::extract::Path(id): axum::extract::Path<i64>| async move {
-                use sea_orm::ConnectionTrait;
-                let result = state.service.database().execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
-                    "DELETE FROM access_reviews WHERE id=? AND stage=0 AND expired_after<=CAST(strftime('%s','now') AS INTEGER)", [id.into()])).await.map_err(database)?;
-                if result.rows_affected()==0 { Err((http::StatusCode::NOT_FOUND,"expired pending review not found".into())) }
-                else { Ok(http::StatusCode::NO_CONTENT) }
-            }
-        ))
-        .route("/std/acl/review/{id}/status", get(review::status))
+        .route(
+            "/std/acl/review",
+            axum::routing::patch(review::decide).delete(review::delete),
+        )
+        .route("/std/acl/review/list", get(review::list_persistent))
+        .route("/std/acl/status", get(review::status))
         .with_state(ApiState { service })
-}
-
-// Owner-managed contact resource. Remote application submission and polling
-// are deliberately absent: those use the existing visitor-owned endpoints.
-async fn put_contact(
-    axum::extract::State(state): axum::extract::State<ApiState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
-    visitor: Option<axum::Extension<crate::Visitor>>,
-    axum::Json(body): axum::Json<serde_json::Value>,
-) -> Result<http::StatusCode, ApiError> {
-    use crate::{ContactStatus, SubjectId};
-    let service = &state.service;
-    let visitor = visitor
-        .as_ref()
-        .ok_or((http::StatusCode::FORBIDDEN, "owner required".into()))?;
-    if visitor.name() != service.owner_name
-        || service.contacts.read().await.get(visitor.name()) != Some(visitor.subject_id())
-    {
-        return Err((http::StatusCode::FORBIDDEN, "owner required".into()));
-    }
-    if name == service.owner_name
-        || name.is_empty()
-        || name.len() > 253
-        || !name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-')
-    {
-        return Err(bad_request("invalid contact name"));
-    }
-    let fields = body
-        .as_object()
-        .ok_or_else(|| bad_request("contact must be an object"))?;
-    for key in fields.keys() {
-        if ![
-            "subject_id",
-            "class",
-            "description",
-            "status",
-            "requested_access",
-            "offers",
-            "expired_after",
-        ]
-        .contains(&key.as_str())
-        {
-            return Err(bad_request(format!("unknown contact field: {key}")));
-        }
-    }
-    let subject = body["subject_id"]
-        .as_str()
-        .ok_or_else(|| bad_request("subject_id is required"))?;
-    let subject =
-        SubjectId::new(subject.as_bytes()).map_err(|_| bad_request("invalid subject_id"))?;
-    let class = fields.get("class").map_or(Ok(""), |v| {
-        v.as_str().ok_or_else(|| bad_request("invalid class"))
-    })?;
-    let description = body["description"]
-        .as_str()
-        .ok_or_else(|| bad_request("description is required"))?;
-    let status = fields
-        .get("status")
-        .map_or(Ok(ContactStatus::Pending), |v| {
-            serde_json::from_value(v.clone()).map_err(bad_request)
-        })?;
-    if !matches!(status, ContactStatus::Pending | ContactStatus::Active) {
-        return Err(bad_request("status must be pending or active"));
-    }
-    let requested_access: RequestedAccess = serde_json::from_value(
-        fields
-            .get("requested_access")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({})),
-    )
-    .map_err(bad_request)?;
-    let offers: GrantedAccess = serde_json::from_value(
-        fields
-            .get("offers")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({})),
-    )
-    .map_err(bad_request)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(internal)?
-        .as_secs();
-    let now = i64::try_from(now).map_err(internal)?;
-    let existing = match service.find_contact_by_name(&name).await {
-        Ok(record) => Some(record),
-        Err(sea_orm::DbErr::RecordNotFound(_)) => None,
-        Err(error) => return Err(database(error)),
-    };
-    let expires = fields.get("expired_after").map_or_else(
-        || {
-            Ok(existing
-                .as_ref()
-                .map_or(now + 7 * 86_400, |record| record.expired_after))
-        },
-        |v| {
-            v.as_i64()
-                .ok_or_else(|| bad_request("invalid expired_after"))
-        },
-    )?;
-    if expires <= now || description.chars().count() > 80 {
-        return Err(bad_request("invalid expiry or description"));
-    }
-    let same = existing.as_ref().is_some_and(|record| {
-        record.subject_id == subject
-            && record.class == class
-            && record.description == description
-            && record.requested_access == requested_access
-            && record.offers == offers
-            && record.expired_after == expires
-    });
-    if let Some(record) = &existing
-        && (!matches!(record.status, 0 | 2 | 3)
-            || (record.status == 0 && !same)
-            || (record.status == 2 && status != ContactStatus::Active))
-    {
-        return Err((
-            http::StatusCode::CONFLICT,
-            "contact cannot be replaced in its current state".into(),
-        ));
-    }
-    if !same {
-        service
-            .create_contact(NewContact {
-                name: name.clone(),
-                subject_id: subject,
-                class: class.to_owned(),
-                description: description.to_owned(),
-                requested_access,
-                offers,
-                created_at: existing.as_ref().map_or(now, |record| record.created_at),
-                updated_at: now,
-                expired_after: expires,
-            })
-            .await
-            .map_err(database)?;
-    }
-    // The resource may remain pending if activation fails; an identical retry
-    // completes it through the library's existing status transition.
-    if status == ContactStatus::Active
-        && !existing.as_ref().is_some_and(|record| record.status == 2)
-    {
-        service
-            .patch_contact(
-                &name,
-                ContactPatch::LocalUpdate {
-                    status: Some(status),
-                    alias: None,
-                },
-            )
-            .await
-            .map_err(database)?;
-    }
-    Ok(if existing.is_none() {
-        http::StatusCode::CREATED
-    } else {
-        http::StatusCode::NO_CONTENT
-    })
-}
-
-/// The caller-owned contact status endpoint is authorized by its verified
-/// visitor identity in the handler, rather than ordinary application rules.
-pub fn is_contact_status_path(method: &http::Method, path: &str) -> bool {
-    method == http::Method::GET && path == "/std/contact/self"
 }
 
 pub(crate) type ApiError = (http::StatusCode, String);
@@ -261,100 +83,64 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn contact_put_requires_owner_and_is_retryable_without_granting_access() {
+    async fn outbound_contact_record_is_internal_retryable_and_never_grants_access() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         for migration in [
             include_str!("migrations/0.sql"),
             include_str!("migrations/1.sql"),
+            include_str!("migrations/2.sql"),
+            include_str!("migrations/3.sql"),
         ] {
             db.execute_unprepared(migration).await.unwrap();
         }
         let service = Arc::new(AccessService::new(db, "owner.example"));
-        let owner_sid = crate::SubjectId::new(b"owner-subject".to_vec()).unwrap();
-        service
-            .contacts
-            .write()
-            .await
-            .insert("owner.example".into(), owner_sid.clone());
-        let app = router(service.clone());
-        let payload = serde_json::json!({"subject_id":"alice-subject", "description":"Alice", "status":"active", "offers":{"/private":{"allow":["GET"]}}});
-        let request = |caller: Option<(&str, &str)>, value: &serde_json::Value| {
-            let mut request = http::Request::builder()
-                .method("PUT")
-                .uri("/std/contact/alice.example")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(value.to_string()))
-                .unwrap();
-            if let Some((name, subject)) = caller {
-                request.extensions_mut().insert(crate::Visitor::new(
-                    name,
-                    crate::SubjectId::new(subject.as_bytes()).unwrap(),
-                ));
-            }
-            request
+        let draft = NewContact {
+            name: "alice.example".into(),
+            subject_id: crate::SubjectId::new(b"alice-subject".to_vec()).unwrap(),
+            class: "Human".into(),
+            description: "Alice".into(),
+            requested_access: Default::default(),
+            offers: serde_json::from_value(serde_json::json!({"/private":{"allow":["GET"]}}))
+                .unwrap(),
+            created_at: 1893455900,
+            updated_at: 1893456000,
+            expired_after: 1893715200,
         };
-        for caller in [
-            None,
-            Some(("alice.example", "alice-subject")),
-            Some(("owner.example", "wrong-subject")),
-        ] {
-            assert_eq!(
-                app.clone()
-                    .oneshot(request(caller, &payload))
-                    .await
-                    .unwrap()
-                    .status(),
-                http::StatusCode::FORBIDDEN
-            );
-        }
-        let caller = Some(("owner.example", "owner-subject"));
-        assert_eq!(
-            app.clone()
-                .oneshot(request(caller, &payload))
-                .await
-                .unwrap()
-                .status(),
-            http::StatusCode::CREATED
-        );
+        service
+            .record_outbound_contact(draft.clone())
+            .await
+            .unwrap();
+        service
+            .record_outbound_contact(draft.clone())
+            .await
+            .unwrap();
         let before = service.find_contact_by_name("alice.example").await.unwrap();
-        assert_eq!(before.status, crate::ContactStatus::Active as i32);
+        assert_eq!(before.status, crate::ContactStatus::Pending as i32);
         assert!(before.granted_access.is_empty());
-        assert_eq!(
-            app.clone()
-                .oneshot(request(caller, &payload))
-                .await
-                .unwrap()
-                .status(),
-            http::StatusCode::NO_CONTENT
-        );
-        assert_eq!(
-            service.find_contact_by_name("alice.example").await.unwrap(),
-            before
-        );
-        let listed = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .uri("/std/contacts")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
+        let mut changed = draft.clone();
+        changed.subject_id = crate::SubjectId::new(b"other-subject".to_vec()).unwrap();
+        assert!(service.record_outbound_contact(changed).await.is_err());
+        service
+            .patch_contact(
+                "alice.example",
+                ContactPatch::LocalUpdate {
+                    status: Some(crate::ContactStatus::Active),
+                    alias: None,
+                },
             )
             .await
             .unwrap();
-        let listed: serde_json::Value =
-            serde_json::from_slice(&listed.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert!(listed["items"][0]["id"].as_i64().unwrap() > 0);
-        assert_eq!(listed["items"][0]["incoming"], false);
-        let mut derived = payload.clone();
-        derived["granted_access"] = serde_json::json!({});
+        service
+            .record_outbound_contact(draft.clone())
+            .await
+            .unwrap();
         assert_eq!(
-            app.clone()
-                .oneshot(request(caller, &derived))
+            service
+                .find_contact_by_name("alice.example")
                 .await
                 .unwrap()
-                .status(),
-            http::StatusCode::BAD_REQUEST
+                .status,
+            crate::ContactStatus::Active as i32
         );
         service
             .patch_contact(
@@ -366,35 +152,168 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            app.oneshot(request(caller, &payload))
+        assert!(
+            service
+                .record_outbound_contact(draft.clone())
                 .await
-                .unwrap()
-                .status(),
-            http::StatusCode::CONFLICT
+                .is_err()
         );
+        service
+            .delete_contacts(&["alice.example".into()])
+            .await
+            .unwrap();
+        let mut stale = draft;
+        stale.created_at = 0;
+        assert!(service.record_outbound_contact(stale).await.is_err());
+        assert!(service.find_contact_by_name("alice.example").await.is_err());
+        let response = router(service)
+            .oneshot(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri("/std/contact?name=alice.example")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn query_targets_reject_ambiguous_or_missing_values_and_old_routes_are_removed() {
+        let service = Arc::new(
+            AccessService::load_from_db(
+                "sqlite::memory:",
+                "owner.example",
+                &crate::SubjectId::new(b"owner").unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let app = router(service);
+        for (method, path, body) in [
+            ("GET", "/std/acl/access?api=", ""),
+            ("GET", "/std/acl/access?api=std/message", ""),
+            ("GET", "/std/acl/access?api=/one&api=/two", ""),
+            (
+                "POST",
+                "/std/acl/access",
+                r#"{"method":"GET","effect":"allow","grantee":"**"}"#,
+            ),
+            ("GET", "/std/acl/allow?name=", ""),
+            ("GET", "/std/acl/allow?name=alice&name=bob", ""),
+            (
+                "PATCH",
+                "/std/acl/allow",
+                r#"{"api":"/files","method":"GET","effect":"allow"}"#,
+            ),
+            (
+                "DELETE",
+                "/std/acl/allow?name=",
+                r#"{"api":"/files","method":"GET"}"#,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    http::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                http::StatusCode::BAD_REQUEST,
+                "{method} {path}"
+            );
+        }
+        for target in [
+            "",
+            "?id=",
+            "?id=0",
+            "?id=-1",
+            "?id=abc",
+            "?id=9223372036854775808",
+            "?id=1&id=2",
+        ] {
+            for (method, path) in [("GET", "/std/acl/status"), ("DELETE", "/std/acl/review")] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        http::Request::builder()
+                            .method(method)
+                            .uri(format!("{path}{target}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    http::StatusCode::BAD_REQUEST,
+                    "{method} {path}{target}"
+                );
+            }
+        }
+        for path in [
+            "/std/acl/access/std/message",
+            "/std/acl/allow/alice",
+            "/std/acl/reviews",
+            "/std/acl/status/1",
+            "/std/acl/review/1",
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        http::Request::builder()
+                            .uri(path)
+                            .body(axum::body::Body::empty())
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                http::StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+        // All supported Grantee forms survive standard query decoding.
+        for name in ["%3F", "*%3F", "**", "editors%40issuer", "alice.smith~"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    http::Request::builder()
+                        .uri(format!("/std/acl/allow?name={name}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK, "{name}");
+        }
     }
 
     #[tokio::test]
     async fn management_router_exposes_contact_rule_and_review_endpoints() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        db.execute_unprepared(include_str!("migrations/0.sql"))
-            .await
-            .unwrap();
-        db.execute_unprepared(include_str!("migrations/1.sql"))
-            .await
-            .unwrap();
+        for migration in [
+            include_str!("migrations/0.sql"),
+            include_str!("migrations/1.sql"),
+            include_str!("migrations/2.sql"),
+            include_str!("migrations/3.sql"),
+        ] {
+            db.execute_unprepared(migration).await.unwrap();
+        }
         let service = Arc::new(AccessService::new(db, "owner.example"));
         service.contacts.write().await.insert(
             String::from("owner.example"),
             crate::SubjectId::new(b"owner-subject".to_vec()).unwrap(),
         );
         let app = router(service);
-        assert!(is_contact_status_path(
-            &http::Method::GET,
-            "/std/contact/self"
-        ));
-        assert!(!is_contact_status_path(&http::Method::GET, "/contact/self"));
         for path in [
             "/contact",
             "/contact/self",
@@ -422,7 +341,7 @@ mod tests {
             .method(http::Method::POST)
             .uri("/std/contact")
             .header(http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(r#"{"application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Alice","requested_access":{},"offers":{}}"#))
+            .body(axum::body::Body::from(r#"{"from":"alice.example","to":"owner.example","application_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","description":"Alice","requested_access":{},"offers":{}}"#))
             .unwrap();
         create.extensions_mut().insert(crate::Visitor::new(
             "alice.example",
@@ -433,13 +352,13 @@ mod tests {
         let receipt: serde_json::Value =
             serde_json::from_slice(&created.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
-        assert_eq!(receipt["status"], "active");
+        assert_eq!(receipt["status"], "pending");
 
         let response = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/std/contacts")
+                    .uri("/std/contact/list")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -472,7 +391,7 @@ mod tests {
             app.clone()
                 .oneshot(
                     http::Request::builder()
-                        .uri("/std/acl/reviews")
+                        .uri("/std/acl/review/list")
                         .body(axum::body::Body::empty())
                         .unwrap(),
                 )
