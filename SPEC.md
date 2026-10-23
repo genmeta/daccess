@@ -22,15 +22,14 @@ Pishoo 补充以下路由，同样先经统一 ACL：
 | --- | --- |
 | POST /std/contact | 本端发起；JSON from、to、description、requested_capabilities、offered_capabilities，可选 expires_after 或 valid_before；202返回联系人投影 |
 | GET /std/contact?name=NAME、GET /std/contact/list | 管理查询合并后台投递状态，未验证主体的意图具有 null id/subject_id、delivery_status 和 delivery_error |
-| GET /std/contact/{name}/profile/avatar | 使用远端提供的头像；校验保存的 SubjectId，无本地覆盖或上传接口 |
 
 独立 /std/contact/application、/std/contact/status、/std/contact/requests 及刷新/删除任务入口均已移除；旧 /std/contacts、/std/contact/{name} CRUD、/std/contact/self 和 /std/contact/local/* 路由被移除。
 
 ## 联系人管理
 
-PUT 接受 subject_id、alias、class、description、status、requested_access、offers、expires_after、valid_before。description 最多 80 字符；alias 最多 80 字符，不允许控制字符。status 仅 pending 或 active，省略时 pending。name 支持完整名称或以 ~ 结尾的 .dhttp.net 简写，不允许 owner 保留名称。
+宿主内部 `record_outbound_contact` 接受 subject_id、alias、class、description、status、requested_access、offers、expires_after、valid_before。description 最多 80 字符；alias 最多 80 字符，不允许控制字符。status 仅 pending 或 active，省略时 pending。name 支持完整名称或以 ~ 结尾的 .dhttp.net 简写，不允许 owner 保留名称。
 
-PUT 在事务中保存完整资源，保持 id、created_at 和已有 ACL。已有 active 不降回 pending，blocked 必须显式通过 PATCH 解除；同名不同 SubjectId 返回 409，不把旧授权转移给新身份。未提供有效期时，已有资源保留到期时间，新资源默认 7 天。requested_access、offers 为声明，最终权限只由 access_rules 决定；不接受写入 granted_access。
+该内部记录操作在事务中保存完整资源，保持 id、created_at 和已有 ACL。已有 active 不降回 pending，blocked 必须显式通过 PATCH 解除；同名不同 SubjectId 返回 409，不把旧授权转移给新身份。未提供有效期时，已有资源保留到期时间，新资源默认 7 天。requested_access、offers 为声明，最终权限只由 access_rules 决定；不接受写入 granted_access。
 
 PATCH 接受 status、alias、expires_after、valid_before，至少一个字段。空 alias 清除别称；active 接受 pending/transfered 或解除 blocked；blocked 拉黑 active/transfered。拉黑保留拒绝规则与原权限快照；不删除联系人。更改关系状态不等于授予聊天权限。原有最后一位 ACL 管理员保护继续适用。
 
@@ -57,7 +56,7 @@ PATCH 接受 status、alias、expires_after、valid_before，至少一个字段�
 
 Named／All 授权面向已验证具名身份或所有访问者，不依赖历史联系人记录的 SubjectId；其 allow 不会因历史主体变更再生成审批。One／Group 等针对身份的 allow 仍在同名 SubjectId 变化时转审批。回执处理器在 ACL 之后继续核对记录归属，不能读取其他身份的记录。
 
-daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/contact allow **、GET /std/acl/status allow **、POST /std/contact allow **，并显式设置 GET /std/contact/list deny *? 以阻断父路径继承，以及公开 Profile／Workspace／能力发现规则。所有规则允许修改、拒绝、删除，重启不补回；本端发起核验真实所有者及所选授权写入权限，不能伪造 from 代发。
+daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/contact allow **、GET /std/acl/status allow **、POST /std/contact allow **，并显式设置 GET /std/contact/list deny *? 以阻断父路径继承，以及 GET /std/acl/permissions 的公开发现规则；不预置 Profile／Workspace 等业务包权限。所有规则允许修改、拒绝、删除，重启不补回；本端发起核验真实所有者及所选授权写入权限，不能伪造 from 代发。
 
 其他 ACL 查询、写入、审批、管理员保护及策略优先级除下述审批扩展外沿用上游 0.1.1；见 UPSTREAM_SPEC.md 的相应算法说明，旧路径和旧 SubjectId 广泛 allow 行为以本文为准。
 
@@ -99,4 +98,4 @@ daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/con
 
 `GET /std/acl/review/list`，`GET /std/acl/status?id=ID`，`DELETE /std/acl/review?id=ID`。id 必须唯一且为正整数；PATCH /std/acl/review 的 body 使用上文必填的 remember 字段。状态查询继续绑定真实 Visitor 的名称和主体。旧对象路径不再注册，旧对象级授权不自动转换为固定入口管理权限。
 
-`/std/acl/permissions` 仍由宿主提供只读 GET；PUT/DELETE 由其他任务实施。
+`/std/acl/permissions` 由宿主提供 GET/PUT/DELETE；安装与更新在同一事务中替换能力声明，已有 ACL 授权保持。

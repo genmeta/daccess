@@ -332,7 +332,7 @@ pub(crate) async fn list_persistent(
             .ok_or_else(|| crate::api::internal("review count missing"))?;
         total += row
             .try_get::<i64>("", "total")
-            .map_err(|e| crate::api::database(e.into()))? as u64;
+            .map_err(crate::api::database)? as u64;
         let rows = db.query_all_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
             format!("SELECT id,visitor,method,api,reason,created_at,CASE WHEN stage=1 THEN coalesce(invalidated_at,grant_expires_at,expired_after) ELSE expired_after END AS expired_after FROM access_reviews WHERE {condition} ORDER BY created_at DESC,id DESC LIMIT ?"),
             [offset.saturating_add(limit).into()])).await.map_err(crate::api::database)?;
