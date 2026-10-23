@@ -154,12 +154,14 @@ fn next_live_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     // Stay within JSON's exact integer range and avoid reusing small IDs after a restart.
     let time = chrono::Utc::now().timestamp_micros() as u64;
-    let previous = NEXT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-            Some((id + 1).max(time))
-        })
-        .unwrap_or_else(|id| id);
-    (previous + 1).max(time)
+    let mut previous = NEXT_ID.load(Ordering::Relaxed);
+    loop {
+        let next = (previous + 1).max(time);
+        match NEXT_ID.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
