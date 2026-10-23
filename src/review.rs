@@ -76,7 +76,7 @@ impl PendingReview {
 /// The response body returned by an adapter for an asynchronous review.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PendingReviewResponse {
-    error: &'static str,
+    status: &'static str,
     review_id: i64,
     status_url: String,
 }
@@ -85,7 +85,7 @@ impl From<PendingReview> for PendingReviewResponse {
     fn from(review: PendingReview) -> Self {
         let review_id = review.id();
         Self {
-            error: "need_review",
+            status: "pending_review",
             review_id,
             status_url: format!("/std/acl/status?id={review_id}"),
         }
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(response).unwrap(),
             serde_json::json!({
-                "error": "need_review", "review_id": 12, "status_url": "/std/acl/status?id=12",
+                "status": "pending_review", "review_id": 12, "status_url": "/std/acl/status?id=12",
             })
         );
     }

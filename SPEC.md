@@ -66,7 +66,7 @@ daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/con
 调用者直接请求业务接口，由接收方统一 ACL 判断，不先申请能力或探测对方权限。合法请求头 `If-Reviewed` 仅允许单个 `waiting` 或 `break`，缺省为 `break`；非法值或重复头返回 400。ACL allow 正常执行，deny 返回 403；匿名 review 拒绝且不建待办。
 
 - `review + waiting`：只登记内存实时待办并等待原请求；批准后继续执行原业务，拒绝返回 403。请求 Future 取消、适配器超时或进程退出时清理，不将待办落库。适配器须设置有界等待；Pishoo 上限 300 秒。
-- `review + break`：保存异步待办，返回 `400 Bad Request`、`Cache-Control: no-store` 和 `{"error":"need_review","review_id":12,"status_url":"/std/acl/status?id=12"}`。默认待办期限 1 天。调用者稍后重试原业务；可选查询状态，不必先访问联系人状态。
+- `review + break`：保存异步待办，返回 `202 Accepted`、`Cache-Control: no-store` 和 `{"status":"pending_review","review_id":12,"status_url":"/std/acl/status?id=12"}`。默认待办期限 1 天。调用者稍后重试原业务；可选查询状态，不必先访问联系人状态。
 
 异步去重键由服务端计算：`SHA256("dhttp/request-id/1" + NUL + LP(method) + LP(normalized_path) + LP(visitor) + LP(subject_id))`，LP 为 8 字节大端长度及原始字节。路径去除 query 并沿用 ACL 规范化；普通请求头、query、正文不参与去重。外部 Request-Id 不控制审核。
 

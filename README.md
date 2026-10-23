@@ -15,7 +15,7 @@
 - 按 API 路径最长匹配规则，支持指定 method 或 `*`。
 - 支持精确联系人、所有已命名来访者、匿名来访者和所有来访者等 grantee。
 - 联系人申请、批准、权限同步、拉黑和恢复。
-- 业务请求触发审核：`If-Reviewed: waiting` 在内存等待，`break` 持久化待办并返回 `400 need_review`；支持本次允许／拒绝，以及记住选择后写入普通 ACL。
+- 业务请求触发审核：`If-Reviewed: waiting` 在内存等待，`break` 持久化待办并返回 `202 pending_review`；支持本次允许／拒绝，以及记住选择后写入普通 ACL。
 - SQLite 持久化与内存 Policies 一致性更新。
 - 可直接挂载到 Axum Router 的管理 API。
 
@@ -110,7 +110,7 @@ match acl
 
 匿名请求必须同时传入 `None, None`；名称与 SubjectId 只能同时存在或同时缺失。匿名请求命中 `review` 时拒绝且不创建待办。`If-Reviewed` 缺省为 `break`，非法值或重复头返回 400。allow/deny 仍由同一套 ACL 决定。
 
-`waiting` 返回 `AuthResult::Waiting`，适配器等待此 Future 后继续原业务请求。待办只存内存，取消、超时或进程退出时清理。Pishoo 将等待上限设为 300 秒。`break` 返回 `AuthResult::Reviewing`，适配器应返回 400 与 `PendingReviewResponse`，并设置 `Cache-Control: no-store`。
+`waiting` 返回 `AuthResult::Waiting`，适配器等待此 Future 后继续原业务请求。待办只存内存，取消、超时或进程退出时清理。Pishoo 将等待上限设为 300 秒。`break` 返回 `AuthResult::Reviewing`，适配器应返回 202 与 `PendingReviewResponse`，并设置 `Cache-Control: no-store`。
 
 `PATCH /std/acl/review` 必须提供 `remember` 布尔值，例如 `{"id":12,"kind":"persistent","action":"allow","remember":false}`。`GET /std/acl/review/list` 返回 `decision_modes: ["once", "always"]`，供客户端确认支持新语义。
 
