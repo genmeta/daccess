@@ -23,10 +23,10 @@ pub struct AccessService {
 
 impl AccessService {
     const MIGRATIONS: [&'static str; 4] = [
-        include_str!("migrations/0.sql"),
-        include_str!("migrations/1.sql"),
-        include_str!("migrations/2.sql"),
-        include_str!("migrations/3.sql"),
+        include_str!("service/sql/schema.sql"),
+        include_str!("service/sql/migrations/v1_add_application_receipts.sql"),
+        include_str!("service/sql/migrations/v2_update_contact_lifecycle.sql"),
+        include_str!("service/sql/migrations/v3_add_review_decisions.sql"),
     ];
     const VERSION: u32 = 3;
 

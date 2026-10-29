@@ -8,12 +8,14 @@ use super::*;
 
 async fn service() -> AccessService {
     let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.execute_unprepared(include_str!("../../../src/migrations/0.sql"))
+    db.execute_unprepared(include_str!("../../../src/service/sql/schema.sql"))
         .await
         .unwrap();
-    db.execute_unprepared(include_str!("../../../src/migrations/1.sql"))
-        .await
-        .unwrap();
+    db.execute_unprepared(include_str!(
+        "../../../src/service/sql/migrations/v1_add_application_receipts.sql"
+    ))
+    .await
+    .unwrap();
     AccessService::new(db, "owner.example")
 }
 

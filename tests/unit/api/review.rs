@@ -8,7 +8,7 @@ use crate::SubjectId;
 
 async fn service() -> AccessService {
     let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.execute_unprepared(include_str!("../../../src/migrations/0.sql"))
+    db.execute_unprepared(include_str!("../../../src/service/sql/schema.sql"))
         .await
         .unwrap();
     AccessService::migrate(&db).await.unwrap();

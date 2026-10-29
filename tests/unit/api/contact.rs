@@ -14,9 +14,9 @@ const APPLICATION_EXPIRED_AFTER: i64 = 1_893_715_200;
 async fn service() -> AccessService {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     for migration in [
-        include_str!("../../../src/migrations/0.sql"),
-        include_str!("../../../src/migrations/1.sql"),
-        include_str!("../../../src/migrations/2.sql"),
+        include_str!("../../../src/service/sql/schema.sql"),
+        include_str!("../../../src/service/sql/migrations/v1_add_application_receipts.sql"),
+        include_str!("../../../src/service/sql/migrations/v2_update_contact_lifecycle.sql"),
     ] {
         db.execute_unprepared(migration).await.unwrap();
     }

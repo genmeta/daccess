@@ -8,10 +8,10 @@ use super::*;
 async fn outbound_contact_record_is_internal_retryable_and_never_grants_access() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     for migration in [
-        include_str!("../../src/migrations/0.sql"),
-        include_str!("../../src/migrations/1.sql"),
-        include_str!("../../src/migrations/2.sql"),
-        include_str!("../../src/migrations/3.sql"),
+        include_str!("../../src/service/sql/schema.sql"),
+        include_str!("../../src/service/sql/migrations/v1_add_application_receipts.sql"),
+        include_str!("../../src/service/sql/migrations/v2_update_contact_lifecycle.sql"),
+        include_str!("../../src/service/sql/migrations/v3_add_review_decisions.sql"),
     ] {
         db.execute_unprepared(migration).await.unwrap();
     }
@@ -222,10 +222,10 @@ async fn query_targets_reject_ambiguous_or_missing_values_and_old_routes_are_rem
 async fn management_router_exposes_contact_rule_and_review_endpoints() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     for migration in [
-        include_str!("../../src/migrations/0.sql"),
-        include_str!("../../src/migrations/1.sql"),
-        include_str!("../../src/migrations/2.sql"),
-        include_str!("../../src/migrations/3.sql"),
+        include_str!("../../src/service/sql/schema.sql"),
+        include_str!("../../src/service/sql/migrations/v1_add_application_receipts.sql"),
+        include_str!("../../src/service/sql/migrations/v2_update_contact_lifecycle.sql"),
+        include_str!("../../src/service/sql/migrations/v3_add_review_decisions.sql"),
     ] {
         db.execute_unprepared(migration).await.unwrap();
     }

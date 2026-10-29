@@ -457,9 +457,9 @@ async fn review_protocol_requires_an_explicit_decision_mode() {
 async fn migration_preserves_historical_decisions_and_the_id_high_water_mark() {
     let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
     for sql in [
-        include_str!("../../src/migrations/0.sql"),
-        include_str!("../../src/migrations/1.sql"),
-        include_str!("../../src/migrations/2.sql"),
+        include_str!("../../src/service/sql/schema.sql"),
+        include_str!("../../src/service/sql/migrations/v1_add_application_receipts.sql"),
+        include_str!("../../src/service/sql/migrations/v2_update_contact_lifecycle.sql"),
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }

@@ -8,7 +8,7 @@
 <profile>/db/access.db
 ```
 
-模块启动时通过 `src/migrations/` 按版本升级数据库结构至 schema v2，并将联系人和规则加载到内存索引。迁移保留已有数据，不转换历史 ACL 路径、不插入默认授权，也不自动替换数据库。默认策略是 deny all、allow profile owner；数据库规则在此基础上覆盖具体 API 和 method。业务默认权限由承载应用首次初始化时设置。
+模块启动时通过 `src/service/sql/schema.sql` 和 `src/service/sql/migrations/` 按版本升级数据库结构至 schema v3，并将联系人和规则加载到内存索引。迁移保留已有数据，不转换历史 ACL 路径、不插入默认授权，也不自动替换数据库。默认策略是 deny all、allow profile owner；数据库规则在此基础上覆盖具体 API 和 method。业务默认权限由承载应用首次初始化时设置。
 
 ## 主要能力
 
@@ -21,7 +21,7 @@
 
 完整的数据模型、状态机和 HTTP API 定义见 [SPEC.md](SPEC.md)。
 
-`feat/contact-acl-v2` 分支包含尚未发布的统一联系人 API 与 schema v2；已发布 `0.1.1` 的历史协议保存在 [UPSTREAM_SPEC.md](UPSTREAM_SPEC.md)。Pishoo 固定使用本分支的具体 Git 提交；共享开发时可临时使用同级本地 path 依赖同步修改和验证。
+`feat/contact-acl-v2` 分支包含尚未发布的统一联系人 API 与 schema v3；已发布 `0.1.1` 的历史协议保存在 [UPSTREAM_SPEC.md](UPSTREAM_SPEC.md)。Pishoo 固定使用本分支的具体 Git 提交；共享开发时可临时使用同级本地 path 依赖同步修改和验证。
 
 ## 接入步骤
 
@@ -204,3 +204,7 @@ Private unit tests live in the owning crate's `tests/unit/` directory, with only
 conditional module declarations in `src/`. Test cases retain their original
 module scope and production API visibility. Run `cargo test --lib` from the Rust
 crate directory; existing integration and frontend suites remain under `tests/`.
+
+## SQL 源码
+
+建库、迁移及测试夹具位置见 [SQL 目录说明](src/service/sql/README.md)。SQL 按用途组织，数据库版本和执行流程保持不变。
