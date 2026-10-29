@@ -6,6 +6,7 @@ mod review;
 mod service;
 
 #[cfg(test)]
+#[path = "../tests/unit/review_tests.rs"]
 mod review_tests;
 
 pub use api::{
