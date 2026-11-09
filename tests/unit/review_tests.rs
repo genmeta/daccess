@@ -35,7 +35,7 @@ async fn service() -> AccessService {
 async fn pending(service: &AccessService, subject: &SubjectId) -> i64 {
     match service
         .auth(
-            headers("/std/message"),
+            headers("/std/comm/message"),
             Some("alice.example"),
             Some(subject),
         )
@@ -85,7 +85,11 @@ async fn once_is_scoped_to_identity_method_and_path_without_comparing_query_or_b
     let other = SubjectId::new(b"other").unwrap();
     assert!(matches!(
         service
-            .auth(headers("/std/message"), Some("alice.example"), Some(&other))
+            .auth(
+                headers("/std/comm/message"),
+                Some("alice.example"),
+                Some(&other)
+            )
             .await
             .unwrap(),
         AuthResult::Reviewing(_)
@@ -93,7 +97,7 @@ async fn once_is_scoped_to_identity_method_and_path_without_comparing_query_or_b
     assert!(matches!(
         service
             .auth(
-                headers("/std/message/child"),
+                headers("/std/comm/message/child"),
                 Some("alice.example"),
                 Some(&subject)
             )
@@ -101,7 +105,7 @@ async fn once_is_scoped_to_identity_method_and_path_without_comparing_query_or_b
             .unwrap(),
         AuthResult::Reviewing(_)
     ));
-    let mut wrong_method = headers("/std/message");
+    let mut wrong_method = headers("/std/comm/message");
     wrong_method.method = http::Method::GET;
     assert!(matches!(
         service
@@ -113,7 +117,7 @@ async fn once_is_scoped_to_identity_method_and_path_without_comparing_query_or_b
     assert!(matches!(
         service
             .auth(
-                headers("/std/message/?different=query"),
+                headers("/std/comm/message/?different=query"),
                 Some("alice.example"),
                 Some(&subject)
             )
@@ -151,12 +155,12 @@ async fn concurrent_calls_can_only_consume_one_allowance() {
         .unwrap();
     let (first, second) = tokio::join!(
         service.auth(
-            headers("/std/message"),
+            headers("/std/comm/message"),
             Some("alice.example"),
             Some(&subject)
         ),
         service.auth(
-            headers("/std/message"),
+            headers("/std/comm/message"),
             Some("alice.example"),
             Some(&subject)
         ),
@@ -209,7 +213,7 @@ async fn denying_once_keeps_the_old_result_and_allows_a_new_round() {
 async fn a_live_once_decision_releases_only_the_selected_waiter() {
     let service = service().await;
     let subject = SubjectId::new(b"alice").unwrap();
-    let mut request = headers("/std/message");
+    let mut request = headers("/std/comm/message");
     request
         .fields
         .insert("if-reviewed", "waiting".parse().unwrap());
@@ -239,7 +243,7 @@ async fn a_live_once_decision_releases_only_the_selected_waiter() {
     assert!(matches!(
         service
             .auth(
-                headers("/std/message"),
+                headers("/std/comm/message"),
                 Some("alice.example"),
                 Some(&subject)
             )
@@ -294,7 +298,7 @@ async fn policy_edits_and_expiry_revoke_unused_allowances() {
     assert!(matches!(
         service
             .auth(
-                headers("/std/message"),
+                headers("/std/comm/message"),
                 Some("alice.example"),
                 Some(&subject)
             )
@@ -314,7 +318,7 @@ async fn remembered_decisions_remain_durable_acl_rules() {
         for _ in 0..2 {
             let result = service
                 .auth(
-                    headers("/std/message"),
+                    headers("/std/comm/message"),
                     Some("alice.example"),
                     Some(&subject),
                 )
@@ -383,7 +387,7 @@ async fn restart_preserves_pending_unused_and_consumed_decisions() {
     assert!(matches!(
         service
             .auth(
-                headers("/std/message"),
+                headers("/std/comm/message"),
                 Some("alice.example"),
                 Some(&subject)
             )
@@ -463,7 +467,7 @@ async fn migration_preserves_historical_decisions_and_the_id_high_water_mark() {
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
-    db.execute_unprepared("UPDATE module SET version=2; INSERT INTO access_reviews(id,request_id,visitor,visitor_sid,method,api,stage,reason,expired_after,updated_at,created_at) VALUES(1,'historical','alice.example',X'616c696365','PUT','/std/message',1,'review',2000000000,2,1),(100,'deleted','alice.example',X'616c696365','PUT','/other',0,'review',2000000000,2,1); DELETE FROM access_reviews WHERE id=100;").await.unwrap();
+    db.execute_unprepared("UPDATE module SET version=2; INSERT INTO access_reviews(id,request_id,visitor,visitor_sid,method,api,stage,reason,expired_after,updated_at,created_at) VALUES(1,'historical','alice.example',X'616c696365','PUT','/std/comm/message',1,'review',2000000000,2,1),(100,'deleted','alice.example',X'616c696365','PUT','/other',0,'review',2000000000,2,1); DELETE FROM access_reviews WHERE id=100;").await.unwrap();
     AccessService::migrate(&db).await.unwrap();
     AccessService::migrate(&db).await.unwrap();
     let service = AccessService::new(db, "owner.example");

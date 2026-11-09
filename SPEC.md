@@ -94,7 +94,7 @@ daccess 建库不写入默认 ACL。Pishoo 仅首次初始化写入 GET /std/con
 
 ## Query 管理资源
 
-`GET/POST /std/acl/access?api=/std/message`，`GET/PATCH/DELETE /std/acl/allow?name=NAME`。GET 缺省目标保留原全部树响应，有目标保留原单对象响应。api 要求开头 /，name 保留特殊 Grantee（?、*?、**、组名@签发者）。标准 query 编码，重复、空目标及写入缺目标为 400。
+`GET/POST /std/acl/access?api=/std/comm/message`，`GET/PATCH/DELETE /std/acl/allow?name=NAME`。GET 缺省目标保留原全部树响应，有目标保留原单对象响应。api 要求开头 /，name 保留特殊 Grantee（?、*?、**、组名@签发者）。标准 query 编码，重复、空目标及写入缺目标为 400。
 
 `GET /std/acl/review/list`，`GET /std/acl/status?id=ID`，`DELETE /std/acl/review?id=ID`。id 必须唯一且为正整数；PATCH /std/acl/review 的 body 使用上文必填的 remember 字段。状态查询继续绑定真实 Visitor 的名称和主体。旧对象路径不再注册，旧对象级授权不自动转换为固定入口管理权限。
 

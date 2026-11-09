@@ -181,7 +181,7 @@ async fn query_targets_reject_ambiguous_or_missing_values_and_old_routes_are_rem
         }
     }
     for path in [
-        "/std/acl/access/std/message",
+        "/std/acl/access/std/comm/message",
         "/std/acl/allow/alice",
         "/std/acl/reviews",
         "/std/acl/status/1",

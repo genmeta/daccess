@@ -48,7 +48,7 @@ async fn old_post_rules_and_approvals_never_authorize_message_put() {
     service
         .set_policy(
             Method::Specified(http::Method::POST),
-            "/std/message",
+            "/std/comm/message",
             Effect::Allow,
             Grantee::Named,
         )
@@ -57,7 +57,7 @@ async fn old_post_rules_and_approvals_never_authorize_message_put() {
     assert!(matches!(
         service
             .auth(
-                headers(http::Method::POST, "/std/message"),
+                headers(http::Method::POST, "/std/comm/message"),
                 Some("alice.example"),
                 Some(&subject)
             )
@@ -68,7 +68,7 @@ async fn old_post_rules_and_approvals_never_authorize_message_put() {
     assert!(matches!(
         service
             .auth(
-                headers(http::Method::PUT, "/std/message"),
+                headers(http::Method::PUT, "/std/comm/message"),
                 Some("alice.example"),
                 Some(&subject)
             )
@@ -76,7 +76,7 @@ async fn old_post_rules_and_approvals_never_authorize_message_put() {
             .unwrap(),
         AuthResult::Denied
     ));
-    service.db.execute_unprepared("INSERT INTO access_reviews(request_id,visitor,visitor_sid,method,api,stage,reason,expired_after,updated_at,created_at) VALUES('old-post','alice.example',X'616c696365','POST','/std/message',0,'old request',4070995200,1,1)").await.unwrap();
+    service.db.execute_unprepared("INSERT INTO access_reviews(request_id,visitor,visitor_sid,method,api,stage,reason,expired_after,updated_at,created_at) VALUES('old-post','alice.example',X'616c696365','POST','/std/comm/message',0,'old request',4070995200,1,1)").await.unwrap();
     service
         .decide_review(1, crate::Action::Allow, true)
         .await
@@ -84,7 +84,7 @@ async fn old_post_rules_and_approvals_never_authorize_message_put() {
     assert!(matches!(
         service
             .auth(
-                headers(http::Method::PUT, "/std/message"),
+                headers(http::Method::PUT, "/std/comm/message"),
                 Some("alice.example"),
                 Some(&subject)
             )
@@ -95,7 +95,7 @@ async fn old_post_rules_and_approvals_never_authorize_message_put() {
     service
         .set_policy(
             Method::Specified(http::Method::PUT),
-            "/std/message",
+            "/std/comm/message",
             Effect::Review,
             Grantee::Named,
         )
@@ -104,7 +104,7 @@ async fn old_post_rules_and_approvals_never_authorize_message_put() {
     assert!(matches!(
         service
             .auth(
-                headers(http::Method::PUT, "/std/message"),
+                headers(http::Method::PUT, "/std/comm/message"),
                 Some("alice.example"),
                 Some(&subject)
             )

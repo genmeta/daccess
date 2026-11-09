@@ -195,7 +195,7 @@ Router、业务 Router 和访问控制中间件。
 Workspace 的前端开发、静态资源构建和浏览器 E2E 在其独立仓库进行；
 daccess 负责 Rust 库、协议文档、测试和当前数据库结构。
 
-管理对象使用 query：`/std/acl/access?api=/std/message`、`/std/acl/allow?name=NAME`、`DELETE /std/acl/review?id=ID`。联系人不再提供 HTTP PUT；本端 POST 编排由宿主验证真实所有者后调用内部落库方法。
+管理对象使用 query：`/std/acl/access?api=/std/comm/message`、`/std/acl/allow?name=NAME`、`DELETE /std/acl/review?id=ID`。联系人不再提供 HTTP PUT；本端 POST 编排由宿主验证真实所有者后调用内部落库方法。
 
 
 ## Test source layout
